@@ -15,10 +15,12 @@ from src.envs_train.env_fault_comms_loss import Env_CommsLossFault
 from src.envs_train.env_fault_byzantine import Env_ByzantineFault
 from src.recovery.rule_based import RULE_BASED_REGISTRY
 from src.recovery.rule_based_detect import RULE_BASED_DETECT_REGISTRY
+from src.recovery.supervisor import SUPERVISOR_REGISTRY
+
 
 # RL: Trainer / Tester
 from src.testing import test_env
-from src.training import RL_Trainer
+from src.training import RL_Trainer, find_latest_model
 
 # ---------------------------------------------------------*/
 # Parameters
@@ -54,12 +56,11 @@ FAULT_OPTIONS = ["none", "sensor_noise", "actuator_degradation", "agent_dropout"
 RECOVERY_REGISTRY = {
     "rule_based": RULE_BASED_REGISTRY,               # oracle: reads ground-truth fault_context
     "rule_based_detect": RULE_BASED_DETECT_REGISTRY,  # must detect the fault itself from observable signals
+    "supervisor": SUPERVISOR_REGISTRY,                # learned policy monitors + intervenes (set_supervisor below)
 }
 
-# Recovery mechanisms planned but not yet implemented (ToDo #5, bullets 2-4).
+# Recovery mechanisms planned but not yet implemented (ToDo #5, bullets 4).
 RECOVERY_STUBS = {
-    "fault_tolerant_marl",
-    "supervisor",
     "llm_replanning",
 }
 
@@ -113,9 +114,20 @@ if input("Train or Test? (train/test): ") == "train":
     TRAIN_MODULAR = 1
     RUN_MODULAR = 0
     FAULT_MODE = "none"  # fault injection only applies during RUN_MODULAR eval
+
+    TRAIN_VARIANT = input(
+        "Train which variant? (vanilla/fault_tolerant/supervisor) [vanilla]: "
+    ).strip().lower()
+    if TRAIN_VARIANT in ("fault_tolerant", "ft"):
+        TRAIN_VARIANT = "fault_tolerant"
+    elif TRAIN_VARIANT in ("supervisor", "supervisor_agent", "sup", "sv"):
+        TRAIN_VARIANT = "supervisor"
+    else:
+        TRAIN_VARIANT = "vanilla"
 else:
     TRAIN_MODULAR = 0
     RUN_MODULAR = 1
+    TRAIN_VARIANT = "vanilla"  # unused outside the train branch
 
     print(f"\nAvailable faults: {', '.join(FAULT_OPTIONS)}")
     FAULT_MODE = input("Inject which fault? (none/sensor_noise/actuator_degradation/agent_dropout/comms_loss/byzantine): ").strip()
@@ -195,6 +207,10 @@ else:
             )
 
 TOTAL_TIMESTEPS = 10_000_000
+# Supervisor policy budget: it only needs to learn a 4-action intervention
+# gating policy over two frozen agents, so far fewer steps than the 10M used
+# to train the modular pair suffice.
+SUPERVISOR_TOTAL_TIMESTEPS = 5_000_000
 STEPS_TRAIN = 200
 STEPS_TEST = 200
 SEED = 42
@@ -209,6 +225,7 @@ DIR = "./img/figures/"
 
 def run_sim(
     TRAIN_MODULAR=TRAIN_MODULAR,
+    TRAIN_VARIANT=TRAIN_VARIANT,
     RUN_MODULAR=RUN_MODULAR,
     TOTAL_TIMESTEPS=TOTAL_TIMESTEPS,
     STEPS_TRAIN=STEPS_TRAIN,
@@ -223,14 +240,35 @@ def run_sim(
     print("--------------------------------")
 
     if TRAIN_MODULAR:
-        print("\n--- Training Modular Agents (Sorting + Pressing), No Masking ---")
-        train_modular_agents(
-            total_timesteps=TOTAL_TIMESTEPS,
-            steps_train=STEPS_TRAIN,
-            steps_test=STEPS_TEST,
-            seed=SEED,
-            tag=TAG,
-        )
+        if TRAIN_VARIANT == "fault_tolerant":
+            print("\n--- Training FAULT-TOLERANT Modular Agents (domain-randomized), No Masking ---")
+            from src.training_fault_tolerant import train_fault_tolerant_modular_agents
+            train_fault_tolerant_modular_agents(
+                total_timesteps=TOTAL_TIMESTEPS,
+                steps_train=STEPS_TRAIN,
+                steps_test=STEPS_TEST,
+                seed=SEED,
+                tag=TAG,
+            )
+        elif TRAIN_VARIANT == "supervisor":
+            print("\n--- Training SUPERVISOR Agent (learned intervention over the vanilla modular pair) ---")
+            from src.training_supervisor import train_supervisor
+            train_supervisor(
+                total_timesteps=SUPERVISOR_TOTAL_TIMESTEPS,
+                steps_train=STEPS_TRAIN,
+                steps_test=STEPS_TEST,
+                seed=SEED,
+                tag=TAG,
+            )
+        else:
+            print("\n--- Training Modular Agents (Sorting + Pressing), No Masking ---")
+            train_modular_agents(
+                total_timesteps=TOTAL_TIMESTEPS,
+                steps_train=STEPS_TRAIN,
+                steps_test=STEPS_TEST,
+                seed=SEED,
+                tag=TAG,
+            )
 
     if RUN_MODULAR:
         print(f"\n--- Running Trained Modular (No-Mask) Agents [fault: {FAULT_MODE}, recovery: {RECOVERY_MODE}] ---")
@@ -292,11 +330,21 @@ def test_modular_pair(sort_agent, press_agent, steps_test, seed, tag):
 def run_trained_modular_agents(steps_test, seed, tag, fault_mode="none", recovery_mode="none"):
     from stable_baselines3 import PPO
 
-    sort_path = "./models/PPO_Sorting_NoMask_10000000.zip"
-    press_path = "./models/PPO_Pressing_NoMask_10000000.zip"
+    if recovery_mode == "fault_tolerant_marl":
+        # "Recovery" here is baked into the weights via domain-randomized
+        # training (see src/training_fault_tolerant.py) - no recovery_hook
+        # correction is applied at eval time, so these load into the SAME
+        # plain fault env everything else uses (see env_class selection below).
+        sort_path = "./models/PPO_Sorting_FaultTolerant_NoMask_10000000.zip"
+        press_path = "./models/PPO_Pressing_FaultTolerant_NoMask_10000000.zip"
+    else:
+        sort_path = "./models/PPO_Sorting_NoMask_10000000.zip"
+        press_path = "./models/PPO_Pressing_NoMask_10000000.zip"
 
     if not (os.path.exists(sort_path) and os.path.exists(press_path)):
-        print(f"⚠️ Modular models not found. Please ensure both {sort_path} and {press_path} exist.")
+        print(f"⚠️ Models not found. Please ensure both {sort_path} and {press_path} exist.")
+        if recovery_mode == "fault_tolerant_marl":
+            print("   (Run 'Train or Test? -> train' then choose 'fault_tolerant' to produce them.)")
         return
 
     sort_model = PPO.load(sort_path)
@@ -306,7 +354,10 @@ def run_trained_modular_agents(steps_test, seed, tag, fault_mode="none", recover
         # No fault -> plain Env_Combined, no fault injected, no recovery involved
         # (a recovery mechanism has nothing to recover from without a fault).
         env_class = None
-    elif recovery_mode == "none":
+    elif recovery_mode in ("none", "fault_tolerant_marl"):
+        # fault_tolerant_marl uses the same plain fault env as "none" -
+        # its robustness lives in the loaded weights above, not an
+        # action-level correction, so no recovery mixin is needed here.
         env_class = FAULT_REGISTRY.get(fault_mode)
     else:
         # Recovery-wrapped fault class, e.g. Env_ByzantineFault_RuleBased.
@@ -330,19 +381,33 @@ def run_trained_modular_agents(steps_test, seed, tag, fault_mode="none", recover
 
     env.set_agents(sort_agent=sort_model, press_agent=press_model)
 
+    if recovery_mode == "supervisor":
+        # The supervisor policy is trained to recover the vanilla modular pair
+        # (see src/training_supervisor.py). Attach the latest checkpoint so the
+        # combo env's recovery_hook() derives its intervention from predict().
+        supervisor_path = find_latest_model("PPO_Supervisor_NoMask")
+        if not supervisor_path:
+            print("⚠️ No trained Supervisor model found. Train one via 'Train or Test? -> train' then 'supervisor'.")
+            return
+        supervisor_model = PPO.load(supervisor_path)
+        env.set_supervisor(supervisor_model)
+        print(f"📂 Loading Supervisor model from: {supervisor_path}")
+
     test_env(env=env, tag=eval_tag, save=SAVE, show=True,
              title=f"Trained Modular Agents (No Mask){title_suffix}",
              steps=steps_test, dir=DIR, seed=seed)
 
     if env_class is not None:
         print(f"\nFault log for this run: {env.fault_log}")
+    if recovery_mode == "supervisor" and env_class is not None:
+        print(f"Supervisor decision log: {env.supervisor_decision_log}")
 
 
 # ---------------------------------------------------------*/
 # Main
 # ---------------------------------------------------------*/
 if __name__ == "__main__":
-    run_sim(TAG=TAG, FAULT_MODE=FAULT_MODE, RECOVERY_MODE=RECOVERY_MODE)
+    run_sim(TAG=TAG, FAULT_MODE=FAULT_MODE, RECOVERY_MODE=RECOVERY_MODE, TRAIN_VARIANT=TRAIN_VARIANT)
 
 # -------------------------Notes-----------------------------------------------*\
 # -----------------------------------------------------------------------------
