@@ -16,11 +16,13 @@ from src.envs_train.env_fault_byzantine import Env_ByzantineFault
 from src.recovery.rule_based import RULE_BASED_REGISTRY
 from src.recovery.rule_based_detect import RULE_BASED_DETECT_REGISTRY
 from src.recovery.supervisor import SUPERVISOR_REGISTRY
+from src.recovery.llm_replanning import LLM_REGISTRY
 
 
 # RL: Trainer / Tester
 from src.testing import test_env
 from src.training import RL_Trainer, find_latest_model
+from utils.metrics import compute_recovery_metrics, print_recovery_metrics, save_recovery_metrics
 
 # ---------------------------------------------------------*/
 # Parameters
@@ -57,12 +59,11 @@ RECOVERY_REGISTRY = {
     "rule_based": RULE_BASED_REGISTRY,               # oracle: reads ground-truth fault_context
     "rule_based_detect": RULE_BASED_DETECT_REGISTRY,  # must detect the fault itself from observable signals
     "supervisor": SUPERVISOR_REGISTRY,                # learned policy monitors + intervenes (set_supervisor below)
+    "llm_replanning": LLM_REGISTRY,                   # LLM reads structured state, plans via tool calls (needs OPENAI_API_KEY)
 }
 
-# Recovery mechanisms planned but not yet implemented (ToDo #5, bullets 4).
-RECOVERY_STUBS = {
-    "llm_replanning",
-}
+# All four recovery mechanisms from the proposal (ToDo #5) are now implemented.
+RECOVERY_STUBS = set()
 
 RECOVERY_OPTIONS = ["none", "rule_based", "rule_based_detect", "fault_tolerant_marl", "supervisor", "llm_replanning"]
 
@@ -204,6 +205,15 @@ else:
             raise NotImplementedError(
                 f"Recovery mechanism '{RECOVERY_MODE}' is planned but not implemented yet. "
                 f"Currently implemented: {list(RECOVERY_REGISTRY.keys())}"
+            )
+
+        if RECOVERY_MODE == "llm_replanning" and not os.environ.get("OPENAI_API_KEY"):
+            raise EnvironmentError(
+                "RECOVERY_MODE='llm_replanning' needs an OpenAI API key. "
+                "Set it before running, e.g.:\n"
+                "    export OPENAI_API_KEY=sk-...\n"
+                "(or put it in a local .env file loaded via python-dotenv). "
+                "Never hardcode the key in source."
             )
 
 TOTAL_TIMESTEPS = 10_000_000
@@ -401,6 +411,30 @@ def run_trained_modular_agents(steps_test, seed, tag, fault_mode="none", recover
         print(f"\nFault log for this run: {env.fault_log}")
     if recovery_mode == "supervisor" and env_class is not None:
         print(f"Supervisor decision log: {env.supervisor_decision_log}")
+    if recovery_mode == "llm_replanning" and env_class is not None:
+        errors = [d for d in env.llm_decision_log if d["error"]]
+        actions = [d["action"] for d in env.llm_decision_log]
+        print(f"\nLLM decision log ({len(env.llm_decision_log)} invocations, "
+              f"{len(errors)} fell back on error):")
+        for d in env.llm_decision_log:
+            print(f"  step {d['step']:>3} | {d['action']:<15} | "
+                  f"sort_mode={d['sort_mode']} press_id={d['press_id']} material={d['material']} | "
+                  f"latency={d['latency_ms']}ms | error={d['error']}")
+        if errors:
+            print(f"⚠️  {len(errors)}/{len(env.llm_decision_log)} LLM calls fell back to pass_through "
+                  f"due to an error (missing key, bad base_url/model, malformed tool call, etc.) — "
+                  f"check the 'error' field above.")
+
+    # ToDo #6 metrics - time-to-recovery, degradation-area, false-recovery
+    # rate, safety-violation count. Deliberately NOT just total reward -
+    # see utils/metrics.py's module docstring for why. Computed (and
+    # logged to log/recovery_metrics.jsonl) for every fault-injected run,
+    # including recovery_mode="none", so the no-recovery baseline sits in
+    # the same comparison table as every mechanism.
+    if env_class is not None:
+        metrics = compute_recovery_metrics(env, fault_mode=fault_mode, recovery_mode=recovery_mode, seed=seed)
+        print_recovery_metrics(metrics)
+        save_recovery_metrics(metrics)
 
 
 # ---------------------------------------------------------*/

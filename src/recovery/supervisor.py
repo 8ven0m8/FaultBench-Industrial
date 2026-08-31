@@ -97,10 +97,12 @@ class SupervisorRecoveryMixin:
         self.supervisor_agent = supervisor_agent    # SB3 policy, or None at train time
         self._pending_supervisor_action = None      # injected by Env_SupervisorTraining wrapper
         self.supervisor_decision_log = []           # per-step record for post-hoc metrics
+        self.detection_log = []                     # same schema as rule_based_detect.py, for utils/metrics.py
 
     def reset(self, *, seed=None, options=None):
         obs, info = super().reset(seed=seed, options=options)
         self.supervisor_decision_log = []
+        self.detection_log = []
         self._pending_supervisor_action = None
         return obs, info
 
@@ -157,21 +159,78 @@ class SupervisorRecoveryMixin:
             sort_obs, press_obs, flat, step_frac, self._last_supervisor_decision_onehot(),
         ])
 
-    def _apply_intervention(self, sort_mode, press_action_discrete, decision):
+    def _get_container_fill_ratio(self):
+        """Return the maximum container fill ratio across materials at the
+        current step. Used to disambigulate fault-driven interventions from
+        container-level-driven interventions in post-hoc analysis."""
+        if not hasattr(self, "reward_data") or not hasattr(self, "material_names"):
+            return None
+
+        step = self.current_step
+        max_ratio = 0.0
+        materials = list(getattr(self, "material_names", []) or [])
+        if "E" not in materials:
+            materials.append("E")
+
+        container_max = getattr(self, "container_max", {}) or {}
+        container_global_max = getattr(self, "container_global_max", None)
+
+        for mat in materials:
+            true_vals = self.reward_data.get(f"{mat}_True", []) or []
+            false_vals = self.reward_data.get(f"{mat}_False", []) or []
+            if step >= len(true_vals) or step >= len(false_vals):
+                continue
+
+            cap = (
+                container_max.get(mat, container_global_max)
+                if container_max
+                else container_global_max
+            )
+            if not cap:
+                continue
+
+            try:
+                level = float(true_vals[step]) + float(false_vals[step])
+                ratio = level / float(cap)
+                max_ratio = max(max_ratio, ratio)
+            except (TypeError, ValueError, ZeroDivisionError):
+                continue
+
+        return max_ratio
+
+    def _apply_intervention(self, sort_mode, press_action_discrete, decision, fault_context):
         recovered_sort = sort_mode
         recovered_press = press_action_discrete
 
-        if decision in (self.INTERVENTION_SORT_ONLY, self.INTERVENTION_BOTH):
+        sort_intervened = decision in (self.INTERVENTION_SORT_ONLY, self.INTERVENTION_BOTH)
+        press_intervened = decision in (self.INTERVENTION_PRESS_ONLY, self.INTERVENTION_BOTH)
+
+        if sort_intervened:
             recovered_sort = self.sorting_rules()
 
-        if decision in (self.INTERVENTION_PRESS_ONLY, self.INTERVENTION_BOTH):
+        if press_intervened:
             press_id, mat_id = self.check_container_level()
             recovered_press = (
                 self.press_action_to_discrete(press_id, mat_id) if press_id is not None else 0
             )
 
+        fill_ratio = self._get_container_fill_ratio()
+
         self.supervisor_decision_log.append({
             "step": self.current_step, "decision": int(decision),
+        })
+        # New canonical field names: intervened_sort / intervened_press.
+        # Old detected_sort_active / detected_press_active kept for backward
+        # compatibility with existing metrics consumers.
+        self.detection_log.append({
+            "step": self.current_step,
+            "intervened_sort": bool(sort_intervened),
+            "intervened_press": bool(press_intervened),
+            "detected_sort_active": bool(sort_intervened),
+            "detected_press_active": bool(press_intervened),
+            "true_sort_active": fault_context["sort_affected"],
+            "true_press_active": fault_context["press_affected"],
+            "container_fill_ratio": fill_ratio,
         })
         return recovered_sort, recovered_press
 
@@ -191,7 +250,7 @@ class SupervisorRecoveryMixin:
         if decision is None:
             return sort_mode, press_action_discrete  # no model attached yet -> pass-through
 
-        return self._apply_intervention(sort_mode, press_action_discrete, decision)
+        return self._apply_intervention(sort_mode, press_action_discrete, decision, fault_context)
 
 
 # ---------------------------------------------------------*/

@@ -54,13 +54,40 @@ class RuleBasedRecoveryMixin:
     specific task that's actually failing rather than overriding a
     healthy agent's decisions too.
 
+    Also logs a per-step detection_log entry with the SAME schema as
+    DetectionRequiredRuleBasedMixin (rule_based_detect.py) - since this
+    mechanism is an oracle, detected_*_active is trivially identical to
+    true_*_active by construction (it never misses/over-triggers), but
+    keeping the schema identical across all four recovery mechanisms lets
+    utils/metrics.py score every mechanism uniformly, including this one
+    as the "perfect detector" reference point (its false-recovery rate
+    should always compute to exactly 0.0 - a useful sanity check on the
+    metrics code itself).
+
     Usage - combine with any fault class, mixin FIRST so Python's MRO
     finds this recovery_hook() before the fault class's own no-op default:
         class Env_AgentDropoutFault_RuleBased(RuleBasedRecoveryMixin, Env_AgentDropoutFault):
             pass
     """
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.detection_log = []  # per-step record for post-hoc scoring (utils/metrics.py)
+
+    def reset(self, *, seed=None, options=None):
+        obs, info = super().reset(seed=seed, options=options)
+        self.detection_log = []
+        return obs, info
+
     def recovery_hook(self, sort_mode, press_action_discrete, fault_context):
+        self.detection_log.append({
+            "step": self.current_step,
+            "detected_sort_active": bool(fault_context["active"] and fault_context["sort_affected"]),
+            "detected_press_active": bool(fault_context["active"] and fault_context["press_affected"]),
+            "true_sort_active": fault_context["sort_affected"],
+            "true_press_active": fault_context["press_affected"],
+        })
+
         if not fault_context["active"]:
             return sort_mode, press_action_discrete
 

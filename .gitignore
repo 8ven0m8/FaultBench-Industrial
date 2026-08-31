@@ -209,3 +209,7 @@ __marimo__/
 **.DS_Store
 *.svg
 .vscode/settings.json
+
+# LLM Evaluation
+faultbench_report.txt
+log/recovery_metrics.jsonl
