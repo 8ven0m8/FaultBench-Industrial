@@ -1,4 +1,4 @@
-# MARL-Env-FI-and-Recovery
+# FaultBench-Industrial. A Benchmark for fault tolerant mechanisms in Multi Agent Reinforcement Learning Industrial Systems
 
 A benchmark for evaluating **self-healing and fault-recovery mechanisms
 in multi-agent industrial control systems**.
@@ -486,7 +486,7 @@ Recovery speed vs. safety violations
 ```
 
 The research proposal recommends multiple random seeds rather than
-relying on single-run results. fileciteturn0file1L58-L65
+relying on single-run results.
 
 ## Research Goal
 
@@ -498,5 +498,21 @@ The ultimate goal is to provide an empirical answer to:
 Rather than evaluating one recovery method in isolation, this project
 creates a common "crash-test laboratory" in which different self-healing
 strategies can be evaluated under identical fault conditions.
+
+## Acknowledgement
+
+This project is built upon the **MARL-SortingEnv** benchmark developed by Maus, Atamna, and Glasmachers. The original environment provides a multi-agent reinforcement learning benchmark for sequential industrial control, combining sorting and pressing operations to study modular versus monolithic control architectures.
+
+The present project extends this baseline by introducing **fault injection and recovery mechanisms** for evaluating the resilience of multi-agent industrial control systems under different failure conditions.
+
+### Original Work
+
+**Paper:**  
+Tom Maus, Asma Atamna and Tobias Glasmachers (2025). [*Balancing Specialization and Centralization: A Multi-Agent Reinforcement Learning Benchmark for Sequential Industrial Control.* ](https://arxiv.org/pdf/2510.20408)
+
+**Original Repository:**  
+[Storm-131/MARL-SortingEnv](https://github.com/Storm-131/MARL-SortingEnv)
+
+The original repository is licensed under the MIT License. :contentReference[oaicite:2]{index=2}
 
 ------------------------------------------------------------------------
