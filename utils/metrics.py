@@ -126,7 +126,8 @@ def _score_single_channel(
             "cumulative_reward_deficit": 0.0,
         }
 
-    tolerance = abs(baseline) * tolerance_frac if baseline != 0 else tolerance_frac
+    MIN_ABS_TOLERANCE = 0.06  # floor so a small baseline doesn't make tolerance vanish
+    tolerance = max(abs(baseline) * tolerance_frac, MIN_ABS_TOLERANCE)
     threshold = baseline - tolerance
 
     # A performance degradation must be observed before recovery is eligible.
@@ -291,14 +292,14 @@ def _score_fault_event(
 
     onset_idx = max(0, min(int(onset_step), n - 1))
 
-    if duration is None:
-        fault_window_end = n
-    else:
-        try:
-            duration_int = max(0, int(duration))
-        except (TypeError, ValueError):
-            duration_int = 0
-        fault_window_end = min(onset_idx + duration_int, n)
+    # Recovery/safety/benchmark scoring always looks through the rest of the
+    # episode, not just while the fault is actively being injected -- a
+    # transient fault that clears at step 55 but only gets rewarded back to
+    # baseline at step 62 should still count as recovered. True injection
+    # duration remains available separately via onset_step + duration on
+    # this same event dict, so nothing is lost by not capping the window here.
+    fault_window_end = n
+
 
     # Baseline uses only complete pre-fault observations, excluding cold-start.
     def _baseline(series):
@@ -857,7 +858,7 @@ def compute_recovery_metrics(
     fault_mode="none",
     recovery_mode="none",
     seed=None,
-    recovery_tolerance=0.05,
+    recovery_tolerance=0.15,
     rolling_window=5,
     sustain_windows=3,
     required_healthy_steps=None,

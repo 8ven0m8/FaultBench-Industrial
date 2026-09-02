@@ -69,9 +69,10 @@ class DetectionRequiredRuleBasedMixin:
 
     BASELINE_WARMUP_STEPS = 30
     ROLLING_WINDOW = 5
-    SORT_REWARD_DROP_THRESHOLD = 0.15
-    PRESS_REWARD_DROP_THRESHOLD = 0.30
+    SORT_REWARD_DROP_FRAC = 0.30
+    PRESS_REWARD_DROP_FRAC = 0.30
     FILL_RATIO_WARNING = 0.85
+    MIN_ABS_DROP = 0.03
     MIN_STICKY_STEPS = 5
 
     def __init__(self, *args, **kwargs):
@@ -113,8 +114,10 @@ class DetectionRequiredRuleBasedMixin:
         recent_sort = self._rolling_mean([r[0] for r in reward_history], self.ROLLING_WINDOW)
         recent_press = self._rolling_mean([r[1] for r in reward_history], self.ROLLING_WINDOW)
 
-        sort_signal = (self._sort_baseline - recent_sort) > self.SORT_REWARD_DROP_THRESHOLD
-        press_signal = (self._press_baseline - recent_press) > self.PRESS_REWARD_DROP_THRESHOLD
+        sort_threshold = max(abs(self._sort_baseline) * self.SORT_REWARD_DROP_FRAC, self.MIN_ABS_DROP)
+        press_threshold = max(abs(self._press_baseline) * self.PRESS_REWARD_DROP_FRAC, self.MIN_ABS_DROP)
+        sort_signal = (self._sort_baseline - recent_sort) > sort_threshold
+        press_signal = (self._press_baseline - recent_press) > press_threshold
 
         # Proactive fill-level check - pure reads, no side effects.
         for mat in self.material_names + ["E"]:
