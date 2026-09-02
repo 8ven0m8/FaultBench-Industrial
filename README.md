@@ -1,4 +1,4 @@
-# FaultBench-Industrial. A Benchmark for fault tolerant mechanisms in Multi Agent Reinforcement Learning Industrial Systems
+# FaultBench-Industrial. A Benchmark for fault recovery mechanisms in Multi Agent Reinforcement Learning Industrial Systems
 
 A benchmark for evaluating **self-healing and fault-recovery mechanisms
 in multi-agent industrial control systems**.
