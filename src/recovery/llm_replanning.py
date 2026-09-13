@@ -111,8 +111,8 @@ class LLMRecoveryMixin(DetectionRequiredRuleBasedMixin):
             parts.append("sort-channel reward has dropped below its warm-up baseline "
                           "(or stayed suspected via hysteresis)")
         if press_suspected:
-            parts.append("press-channel reward dropped below baseline, or a container "
-                          "is above the fill-ratio warning threshold")
+            parts.append("press-channel reward has dropped below its warm-up baseline "
+                          "(or stayed suspected via hysteresis)")
         return "; ".join(parts) if parts else "periodic re-plan while still suspected"
 
     def _recent_decisions_for_prompt(self):

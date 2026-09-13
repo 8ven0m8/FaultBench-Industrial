@@ -63,7 +63,7 @@ class Env_SupervisorTraining(gym.Env):
     FAULT_TYPE_CHOICES = [
         "sensor_noise", "actuator_degradation", "agent_dropout", "comms_loss", "byzantine",
     ]
-    FAULT_PROB = 0.8                  # fraction of episodes that get a fault at all
+    FAULT_PROB = 0.6                  # fraction of episodes that get a fault at all
     TRANSIENT_PROB = 0.7              # of faulted episodes, fraction transient vs permanent
     TRANSIENT_DURATION_RANGE = (10, 40)
     INJECTION_STEP_RANGE = (40, 60)   # matches DEFAULT_FAULT_CONFIG in main.py
@@ -131,9 +131,9 @@ class Env_SupervisorTraining(gym.Env):
             "seed": int(self._rng.integers(0, 2**31 - 1)),
         }
 
-    def _make_env(self, combo_key, fault_config):
+    def _make_env(self, combo_key, fault_config, episode_seed):
         env = SUPERVISOR_REGISTRY[combo_key](
-            max_steps=self.max_steps, seed=self.seed, fault_config=fault_config,
+            max_steps=self.max_steps, seed=episode_seed, fault_config=fault_config,
         )
         env.set_agents(sort_agent=self.sort_model, press_agent=self.press_model)
         return env
@@ -155,8 +155,22 @@ class Env_SupervisorTraining(gym.Env):
             fault_config = self._no_fault_config()
             combo_key = "sensor_noise"  # any combo class; fault can never fire with this config
 
-        self.env = self._make_env(combo_key, fault_config)
-        obs, info = self.env.reset(seed=self.seed)
+        # Fresh per-episode seed for the underlying combo env, drawn from the
+        # persistent self._rng (which also drives fault-type/target sampling
+        # above) rather than reusing the fixed self.seed every episode. The
+        # old `self.env.reset(seed=self.seed)` reseeded the material
+        # generator (SeasonalInputGenerator, via Env_Super.reset) to the
+        # IDENTICAL stream every single episode - verified empirically: the
+        # first 5 generated material batches were byte-identical across
+        # episodes, only the fault overlay varied. Since main.py's eval also
+        # uses seed=42 (the same constant this trained on), the supervisor
+        # was effectively trained and evaluated on one fixed world, letting
+        # it partially shortcut with memorized step-indexed cues instead of
+        # learning a genuinely state-conditioned intervention policy - a
+        # likely contributor to its high false-positive rate.
+        episode_seed = int(self._rng.integers(0, 2**31 - 1))
+        self.env = self._make_env(combo_key, fault_config, episode_seed)
+        obs, info = self.env.reset(seed=episode_seed)
         return self.env.get_supervisor_obs(), info
 
     def step(self, action):

@@ -78,7 +78,14 @@ def _train_ppo(env, total_timesteps, save_prefix, logpath, eval_seed=99):
     os.makedirs(tensorboard_log, exist_ok=True)
     time.sleep(0.1)
 
-    policy_kwargs = dict(net_arch=dict(pi=[32, 32], vf=[32, 32]))
+    # Bigger than training.py's vanilla [32, 32]: the fault-tolerant agents
+    # have to fit a much wider training distribution (5+ fault types x
+    # modes x transient/permanent, domain-randomized) on the same 10M-step
+    # budget, not just the single clean-operation task vanilla training
+    # sees - measured to bottleneck as a ~24-point reward gap vs vanilla on
+    # a completely clean, fault-free episode even with identical
+    # hyperparameters otherwise.
+    policy_kwargs = dict(net_arch=dict(pi=[64, 64], vf=[64, 64]))
     model = PPO(
         "MlpPolicy", env,
         policy_kwargs=policy_kwargs, verbose=0,

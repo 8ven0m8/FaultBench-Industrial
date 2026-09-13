@@ -6,12 +6,19 @@
 # (sorting_rules() for sort, check_container_level() for press), but with
 # one deliberate difference: it is NEVER told fault_context["active"] /
 # ["sort_affected"] / ["press_affected"] to decide WHETHER or WHERE to
-# intervene. It has to notice trouble itself, from signals a real operator
+# intervene. It has to notice trouble itself, from a signal a real operator
 # could actually observe:
 #   - the reward the system actually logged last step (self.reward_data),
 #     compared against a baseline established during a warm-up window
-#   - live container fill ratios (a supervisor would obviously watch tank
-#     levels, not just a scalar reward)
+#
+# (An earlier version also watched live container fill ratios, on the
+# theory that a starving container is dangerous even before it drags the
+# reward average down. Measured against the trained agents on fault-free
+# episodes, fill ratio routinely sits above 0.85 for many consecutive
+# steps as normal fill/press cycling, with no discriminative power over
+# real faults - it made this mechanism false-positive on the press
+# channel ~70% of a typical episode and score below the no-recovery
+# baseline. Removed; see DetectionRequiredRuleBasedMixin's docstring.)
 #
 # fault_context IS still read here - but ONLY after a detection decision
 # has already been made, purely to log whether that decision was correct
@@ -50,12 +57,52 @@ class DetectionRequiredRuleBasedMixin:
          monitor's calibration period, and conveniently the default fault
          injection window (steps 40-60) always starts after it.
       2. Live signal: every step, the rolling mean reward over the last
-         ROLLING_WINDOW logged steps is compared against the baseline.
-         A drop bigger than *_DROP_THRESHOLD on a channel marks it
-         "suspected". Container fill ratio above FILL_RATIO_WARNING also
-         marks the press channel suspected on its own, since a starving
-         container is dangerous even if it hasn't dragged the rolling
-         reward average down yet.
+         ROLLING_WINDOW logged steps is compared against the baseline. A
+         drop bigger than the per-channel threshold marks it "suspected".
+         The threshold is the larger of a fixed fraction of the baseline
+         AND STD_MULTIPLIER times the channel's own warm-up reward std -
+         see below for why the std term is load-bearing, not decorative.
+
+         (A proactive "container fill ratio above 0.85" trigger used to
+         live here too, on the theory that a starving container is
+         dangerous even before it drags the reward average down. Measured
+         against the actual trained agents on fault-free episodes, fill
+         ratio routinely reaches 0.85-1.1 and stays there for 3-20+
+         consecutive steps as normal fill/press cycling - it has no
+         discriminative power over real faults, and with MIN_STICKY_STEPS
+         hysteresis it kept the press channel falsely "suspected" ~70% of
+         a typical episode, hijacking a correctly-trained press policy
+         with the crude check_container_level() heuristic almost
+         continuously. Removed; detection relies solely on the reward-drop
+         signal now.)
+
+         (The reward-drop threshold itself was ALSO under-calibrated for
+         the press channel specifically: press_reward has a near-zero
+         warm-up mean (~0.15) but a large natural std (~0.3-0.35, full
+         range -1..1, since it's a sparse/bursty per-press signal, not a
+         smooth per-step one) - a fraction-of-mean threshold on a
+         near-zero mean collapses to MIN_ABS_DROP, which is tiny next to
+         that natural volatility. Measured on fault-free episodes, the
+         rolling-mean press reward can dip up to ~0.85 below its own
+         warm-up baseline with zero fault present, comparable to or larger
+         than some real fault effects - a fixed fraction-of-mean threshold
+         was flagging the press channel "suspected" on 60-95% of steps
+         regardless of whether any fault was active. STD_MULTIPLIER anchors
+         the threshold to that channel's own measured noise floor instead,
+         which sort_reward (low-variance, mean ~0.4-0.5) barely changes -
+         its threshold is still governed by SORT_REWARD_DROP_FRAC - but
+         which pulls press_reward's effective threshold up to roughly
+         where its noise ceiling actually sits. This trades away recall on
+         the weakest configured faults (e.g. default sensor_noise,
+         noise_std=0.1, whose ~0.45 average press-reward drop is itself
+         smaller than the noise ceiling - no reward-only detector can
+         cleanly separate that from natural variance) in exchange for
+         collapsing false positives on healthy episodes; it reliably still
+         catches the more severe fault types (agent_dropout /
+         actuator_degradation "stuck" pin press reward at the reward
+         floor, a ~1.15 drop, well clear of the noise ceiling). Worth
+         reporting as a real detector limitation in the writeup, not
+         silently smoothing over it.)
       3. Hysteresis: once a channel is suspected, it stays "in recovery"
          for at least MIN_STICKY_STEPS steps even if the signal clears
          for a step or two, to avoid flapping between corrected and
@@ -71,7 +118,7 @@ class DetectionRequiredRuleBasedMixin:
     ROLLING_WINDOW = 5
     SORT_REWARD_DROP_FRAC = 0.30
     PRESS_REWARD_DROP_FRAC = 0.30
-    FILL_RATIO_WARNING = 0.85
+    STD_MULTIPLIER = 3.0
     MIN_ABS_DROP = 0.03
     MIN_STICKY_STEPS = 5
 
@@ -79,6 +126,8 @@ class DetectionRequiredRuleBasedMixin:
         super().__init__(*args, **kwargs)
         self._sort_baseline = None
         self._press_baseline = None
+        self._sort_std = None
+        self._press_std = None
         self._sort_cooldown = 0
         self._press_cooldown = 0
         self.detection_log = []  # per-step record for post-hoc scoring, see _log_detection_step()
@@ -87,6 +136,8 @@ class DetectionRequiredRuleBasedMixin:
         obs, info = super().reset(seed=seed, options=options)
         self._sort_baseline = None
         self._press_baseline = None
+        self._sort_std = None
+        self._press_std = None
         self._sort_cooldown = 0
         self._press_cooldown = 0
         self.detection_log = []
@@ -100,6 +151,12 @@ class DetectionRequiredRuleBasedMixin:
         recent = values[-window:]
         return sum(recent) / len(recent) if recent else 0.0
 
+    @staticmethod
+    def _pstdev(values, mean):
+        if not values:
+            return 0.0
+        return (sum((v - mean) ** 2 for v in values) / len(values)) ** 0.5
+
     def _detect(self):
         reward_history = self.reward_data.get("Reward", [])  # list of (r_sort, r_press) tuples
 
@@ -108,24 +165,34 @@ class DetectionRequiredRuleBasedMixin:
 
         if self._sort_baseline is None:
             warmup = reward_history[:self.BASELINE_WARMUP_STEPS]
-            self._sort_baseline = sum(r[0] for r in warmup) / len(warmup)
-            self._press_baseline = sum(r[1] for r in warmup) / len(warmup)
+            warmup_sort = [r[0] for r in warmup]
+            warmup_press = [r[1] for r in warmup]
+            self._sort_baseline = sum(warmup_sort) / len(warmup_sort)
+            self._press_baseline = sum(warmup_press) / len(warmup_press)
+            self._sort_std = self._pstdev(warmup_sort, self._sort_baseline)
+            self._press_std = self._pstdev(warmup_press, self._press_baseline)
 
         recent_sort = self._rolling_mean([r[0] for r in reward_history], self.ROLLING_WINDOW)
         recent_press = self._rolling_mean([r[1] for r in reward_history], self.ROLLING_WINDOW)
 
-        sort_threshold = max(abs(self._sort_baseline) * self.SORT_REWARD_DROP_FRAC, self.MIN_ABS_DROP)
-        press_threshold = max(abs(self._press_baseline) * self.PRESS_REWARD_DROP_FRAC, self.MIN_ABS_DROP)
+        # Threshold is whichever is larger: a fraction of the baseline, or a
+        # multiple of the channel's own warm-up noise. The std term is what
+        # actually protects a near-zero-mean, high-variance channel like
+        # press_reward from tripping on its own natural volatility - see
+        # the class docstring for the measured false-positive rates this
+        # fixes.
+        sort_threshold = max(
+            abs(self._sort_baseline) * self.SORT_REWARD_DROP_FRAC,
+            self._sort_std * self.STD_MULTIPLIER,
+            self.MIN_ABS_DROP,
+        )
+        press_threshold = max(
+            abs(self._press_baseline) * self.PRESS_REWARD_DROP_FRAC,
+            self._press_std * self.STD_MULTIPLIER,
+            self.MIN_ABS_DROP,
+        )
         sort_signal = (self._sort_baseline - recent_sort) > sort_threshold
         press_signal = (self._press_baseline - recent_press) > press_threshold
-
-        # Proactive fill-level check - pure reads, no side effects.
-        for mat in self.material_names + ["E"]:
-            level = self.container_materials.get(mat, 0) + self.container_materials.get(f"{mat}_False", 0)
-            cap = self.container_max.get(mat, self.container_global_max)
-            if cap > 0 and (level / cap) > self.FILL_RATIO_WARNING:
-                press_signal = True
-                break
 
         # Hysteresis: sticky once suspected.
         if sort_signal:

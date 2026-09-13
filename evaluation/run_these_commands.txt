@@ -1,0 +1,149 @@
+FaultBench-Industrial — post-fix retrain + resweep checklist
+==============================================================
+
+All commands below must be run from the REPO ROOT (the directory
+containing main.py, config.yml, src/, utils/), NOT from inside evaluation/
+— these scripts assume that cwd, same convention as main.py itself
+(models/, log/, img/ are all found relative to cwd, not to the script's
+own location).
+
+NOTE: per current git status, steps 1 and 2 (retraining) already ran —
+models/PPO_*_FaultTolerant_* and PPO_Supervisor_* are newer than their
+models/prev/ archives. Skip straight to step 4 unless you want to retrain
+again from scratch.
+
+1) RETRAIN the fault-tolerant agents (uses the updated curriculum in
+   src/envs_train/env_1_sort_fault_tolerant.py, env_2_press_fault_tolerant.py,
+   and the bigger network in src/training_fault_tolerant.py).
+
+    python main.py
+
+   When prompted:
+     Train or Test? (train/test):            train
+     Train which variant? (vanilla/fault_tolerant/supervisor):   fault_tolerant
+
+   Trains the sort agent, then the press agent, 10M timesteps each.
+   Old checkpoints are auto-archived to ./models/prev/ — you do NOT need
+   to delete anything before this step.
+
+   Do NOT re-run the "vanilla" variant — it wasn't touched and doesn't
+   need retraining.
+
+
+2) RETRAIN the supervisor agent (uses the fixed per-episode world
+   diversity + rebalanced FAULT_PROB in
+   src/envs_train/env_supervisor_train.py — a training-diversity bug was
+   found and fixed there: it used to reset the underlying combo env to a
+   FIXED seed every single episode, so it trained on one repeating world).
+
+    python main.py
+
+   When prompted:
+     Train or Test? (train/test):            train
+     Train which variant? (vanilla/fault_tolerant/supervisor):   supervisor
+
+   ~5M timesteps, uses whatever vanilla sort/press checkpoints are
+   currently in ./models/ (does NOT depend on step 1's fault-tolerant
+   checkpoints). Old supervisor checkpoint auto-archived to
+   ./models/prev/, same as step 1.
+
+
+3) QUICK SANITY CHECK — did the fault-tolerant retrain actually help?
+   (~10 seconds; this only checks the fault-tolerant models from step 1,
+   not the supervisor — there's no equivalent quick check for step 2, its
+   effect only shows up in the full sweep's intervention_precision /
+   false_recovery_rate numbers).
+
+   IMPORTANT: this script reports raw total_reward, a different scale
+   from step 6's aggregated metrics. A shrinking gap here is a good sign
+   but isn't the same claim as "the aggregated metrics improved" — see
+   step 6 for the numbers that actually matter.
+
+    python evaluation/check_ft_baseline.py
+
+   Compares old vs. new gaps on 3 targeted episodes (clean baseline,
+   the newly-added "restrict" actuator mode, and agent_dropout). Just a
+   smoke test — read the printed verdicts, then move on regardless.
+
+
+4) CLEAR THE OLD SWEEP LOG before rerunning — it's append-only and does
+   NOT dedupe by run_id, so skipping this step will silently mix
+   pre-retrain and post-retrain results (and single-seed and multi-seed
+   results) in the same file.
+
+    rm log/recovery_metrics_sweep.jsonl
+
+   Do NOT pass --resume to run_full_sweep.py against a log from a
+   different set of checkpoints or a different --seeds value — it only
+   checks run_id presence, it has no idea the underlying models changed.
+
+
+5) RUN THE FULL SWEEP, multi-seed (all 5 fault types x targets x
+   durations x modes x 6 recovery mechanisms x 8 seed realizations).
+
+    python evaluation/run_full_sweep.py --skip-llm
+
+   --seeds defaults to 8 now — every combo runs 8 times with independently
+   derived episode + fault-injection seeds (see run_full_sweep.py's
+   derive_trial_seeds()), NOT the same single realization 8 times. This is
+   the fix for "a single run can't tell a real effect from seed luck."
+   Override with --seeds N if you want fewer/more; --seeds 1 reproduces
+   the old single-shot behavior.
+
+   Drop --skip-llm only if you want to spend real OpenAI API calls on the
+   llm_replanning arm too — with 8 seeds that's 8x the API cost of a
+   single-shot run, so consider `--seeds 3` (or fewer) for a first
+   multi-seed pass that includes llm_replanning, then widen later.
+   Add --dry-run first to see the total run count without executing
+   anything (prints every run_id + its derived seeds).
+
+   This will take roughly 8x as long as your first sweep did. Time it
+   accordingly.
+
+
+6) AGGREGATE across seeds — this is the actual "who wins" comparison.
+
+    python evaluation/aggregate_benchmark_scores.py
+
+   Groups every combo's seed realizations together and reports MEAN ±
+   95% CI for: corrected degradation-area, a weighted safety-violation
+   excess, and false-recovery rate. No composite score — we removed that
+   (see utils/metrics.py's header comment for why): it used arbitrary
+   fixed weights, saturated at 100 on a large fraction of runs, and hid
+   the speed-vs-safety trade-off the research questions are actually
+   about. Compare mechanisms on these numbers directly.
+
+   Time-to-recovery used to be reported too — also removed. It's only
+   meaningful over events that both recovered AND weren't a null result,
+   and that qualifying subset's size/composition differs wildly by
+   mechanism (a mechanism that fully neutralizes a fault gets that event
+   excluded entirely as a null result, while a mechanism that never
+   touches the fault keeps a bigger, easier-composed pool) — this was
+   producing misleading "faster recovery" numbers for mechanisms doing
+   less, not more. IMPORTANT: reading the charts — shorter bar = better on
+   both remaining metrics (they measure damage/danger caused, not a
+   score), the opposite of the old benchmark_score convention.
+
+   Also reports each group's null-result rate as a diagnostic (how often
+   the fault was too weak to measure at all) — this isn't filtered out,
+   it washes out naturally once you're averaging over 8 seeds instead of 1.
+
+   Outputs to img/figures/benchmarks/:
+     aggregate_summary.csv                 - fault_mode x recovery_mode,
+                                              pooled across every combo
+                                              (the headline table)
+     aggregate_detailed.csv                - fine-grained, per
+                                              target/duration/mode combo
+     aggregate_faceted__<fault>__<metric>.png - target as rows, duration as
+                                              columns, per recovery mode -
+                                              use this to catch patterns
+                                              the pooled chart averages away
+
+
+That's it. Files involved, for reference (all in evaluation/ except main.py):
+  main.py                                    - training entry point (steps 1 & 2)
+  evaluation/check_ft_baseline.py            - quick post-retrain check (step 3)
+  evaluation/run_full_sweep.py               - full fault x recovery x seed grid (step 5)
+  evaluation/aggregate_benchmark_scores.py   - multi-seed mean ± CI comparison (step 6)
+  evaluation/verify_workings.py              - pre-flight sanity battery, run before
+                                                trusting any of the above (see README.md)

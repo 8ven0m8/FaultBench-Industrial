@@ -8,7 +8,14 @@
 #   -> Intervention precision / recall / F1 (formerly false-recovery rate)
 #   -> Safety-violation count (fill-level + quality/purity tiers)
 #   -> Per-channel reward scoring
-#   -> Composite benchmark score
+#
+# There used to be a composite 0-100 "benchmark_score" here too (a weighted
+# blend of safety/deficit/relapse/ttr penalties). Removed: it used somewhat
+# arbitrary fixed weights, saturated at 100 on a large fraction of runs
+# (hiding real differences between mechanisms), and collapsed exactly the
+# speed-vs-safety trade-off the research questions are about into one
+# number. Compare mechanisms on the primitive metrics below directly
+# instead - see evaluation/aggregate_benchmark_scores.py.
 #
 # IMPORTANT SEMANTIC DISTINCTION
 # --------------------------------
@@ -232,6 +239,21 @@ def _score_single_channel(
 # ---------------------------------------------------------*/
 # Time-to-recovery + degradation-area
 # ---------------------------------------------------------
+def _baseline_reward(series, onset_idx, cold_start_steps):
+    """Pre-fault baseline reward, excluding cold-start ramp-up steps.
+    Hoisted to module level (was a closure inside _score_fault_event) so
+    compute_recovery_metrics can score a control run's own baseline the
+    same way when building a null-correction reference."""
+    pre_fault = series[:onset_idx]
+    if len(pre_fault) > cold_start_steps:
+        return sum(pre_fault[cold_start_steps:]) / len(pre_fault[cold_start_steps:])
+    elif pre_fault:
+        return sum(pre_fault) / len(pre_fault)
+    else:
+        fallback = series[cold_start_steps:min(cold_start_steps + 10, len(series))]
+        return sum(fallback) / len(fallback) if fallback else 0.0
+
+
 def _score_fault_event(
     total_series,
     sort_series,
@@ -241,16 +263,44 @@ def _score_fault_event(
     tolerance_frac,
     required_healthy_steps=15,
     cold_start_steps=5,
+    target=None,
+    control_total_series=None,
+    control_sort_series=None,
+    control_press_series=None,
+    null_result_epsilon=2.0,
 ):
     """
     Score performance recovery for one fault event.
 
     Tracks the *entire* fault-active window, recording every recovery/relapse
     cycle, per-channel deficits, and window-complete (non-truncated) metrics.
+
+    target : str or None
+        The fault's "sort"/"press"/"both" target (from fault_log). When given,
+        the untouched channel's metrics are reported as None instead of being
+        scored against its own natural (fault-unrelated) reward variance -
+        e.g. a target="sort" fault no longer gets a spurious press_degradation_area
+        computed from press reward fluctuation the fault never caused.
+    control_total_series / control_sort_series / control_press_series : list or None
+        Reward series from a matching NO-FAULT control episode (same seed,
+        same agent weights, same episode length). When given, this function
+        also reports "*_corrected" degradation-area fields = the fault run's
+        degradation area minus the control run's OWN degradation area over
+        the identical window, scored the identical way. This nets out the
+        shared non-stationary-reward artifact that a single fixed-seed
+        episode has even with zero fault effect (see null_result_epsilon)
+        rather than reporting the raw absolute area, which conflates real
+        fault-induced degradation with natural episode dynamics.
+    null_result_epsilon : float
+        Below this corrected degradation-area threshold, the event is
+        flagged "likely_null_result" - i.e. statistically indistinguishable
+        from what an unfaulted control episode already shows on its own.
     """
     n = len(total_series)
     required_healthy_steps = max(1, int(required_healthy_steps))
     tolerance_frac = max(0.0, float(tolerance_frac))
+    sort_target = target in (None, "sort", "both")
+    press_target = target in (None, "press", "both")
 
     if n == 0:
         return {
@@ -281,6 +331,12 @@ def _score_fault_event(
             "press_recovered": None,
             "sort_first_recovery_step": None,
             "press_first_recovery_step": None,
+            "target": target,
+            "total_degradation_area_corrected": None,
+            "sort_degradation_area_corrected": None,
+            "press_degradation_area_corrected": None,
+            "control_total_degradation_area": None,
+            "likely_null_result": None,
             "reward_recovery_window_end": 0,
             "fault_active_window_end": 0,
             # Backward compatibility aliases
@@ -303,14 +359,7 @@ def _score_fault_event(
 
     # Baseline uses only complete pre-fault observations, excluding cold-start.
     def _baseline(series):
-        pre_fault = series[:onset_idx]
-        if len(pre_fault) > cold_start_steps:
-            return sum(pre_fault[cold_start_steps:]) / len(pre_fault[cold_start_steps:])
-        elif pre_fault:
-            return sum(pre_fault) / len(pre_fault)
-        else:
-            fallback = series[cold_start_steps:min(cold_start_steps + 10, len(series))]
-            return sum(fallback) / len(fallback) if fallback else 0.0
+        return _baseline_reward(series, onset_idx, cold_start_steps)
 
     baseline_total = _baseline(total_series)
     baseline_sort = _baseline(sort_series) if sort_series else 0.0
@@ -319,16 +368,56 @@ def _score_fault_event(
     total_metrics = _score_single_channel(
         total_series, onset_idx, fault_window_end, baseline_total, tolerance_frac, required_healthy_steps
     )
+    # FIX (#2): only score a channel if this fault's target actually
+    # includes it. A target="sort" fault leaves press untouched, so scoring
+    # press against its own baseline was previously reporting the press
+    # channel's ordinary reward variance (up to ~90 "degradation area" units
+    # in practice) as if it were fault-induced degradation.
     sort_metrics = _score_single_channel(
         sort_series, onset_idx, fault_window_end, baseline_sort, tolerance_frac, required_healthy_steps
-    ) if sort_series else None
+    ) if (sort_series and sort_target) else None
     press_metrics = _score_single_channel(
         press_series, onset_idx, fault_window_end, baseline_press, tolerance_frac, required_healthy_steps
-    ) if press_series else None
+    ) if (press_series and press_target) else None
+
+    # FIX (#3): null-correction against a matching no-fault control episode.
+    # Even a channel this fault DID target, and even the combined total
+    # series, has its own natural non-stationary reward pattern within a
+    # single fixed-seed episode (queue backlog, changing material mix,
+    # etc.) - a control run with the identical seed/agents/episode length
+    # but NO fault shows the exact same "degradation_area" artifact scored
+    # against its own early-window baseline, purely from that non-stationarity.
+    # Subtracting the control run's own score over the identical window nets
+    # that shared artifact out, leaving only the fault's incremental effect.
+    def _control_correction(series, control_series, base_metrics):
+        if not control_series or base_metrics is None:
+            return None, None
+        control_baseline = _baseline(control_series)
+        control_metrics = _score_single_channel(
+            control_series, onset_idx, fault_window_end, control_baseline, tolerance_frac, required_healthy_steps
+        )
+        corrected_area = round(
+            max(0.0, base_metrics["total_degradation_area"] - control_metrics["total_degradation_area"]), 4
+        )
+        return corrected_area, control_metrics["total_degradation_area"]
+
+    total_area_corrected, control_total_area = _control_correction(
+        total_series, control_total_series, total_metrics
+    )
+    sort_area_corrected, control_sort_area = _control_correction(
+        sort_series, control_sort_series, sort_metrics
+    )
+    press_area_corrected, control_press_area = _control_correction(
+        press_series, control_press_series, press_metrics
+    )
+    likely_null_result = (
+        total_area_corrected is not None and total_area_corrected < null_result_epsilon
+    )
 
     result = {
         "onset_step": int(onset_step),
         "duration": duration,
+        "target": target,
         "pre_fault_baseline_reward": total_metrics["baseline_reward"],
         "pre_fault_baseline_sort_reward": sort_metrics["baseline_reward"] if sort_metrics else None,
         "pre_fault_baseline_press_reward": press_metrics["baseline_reward"] if press_metrics else None,
@@ -348,6 +437,10 @@ def _score_fault_event(
         "fraction_time_healthy": total_metrics["fraction_time_healthy"],
         "total_degradation_area": total_metrics["total_degradation_area"],
         "cumulative_reward_deficit": total_metrics["cumulative_reward_deficit"],
+        # --- null-corrected fields (None unless control_*_series was passed in) ---
+        "total_degradation_area_corrected": total_area_corrected,
+        "control_total_degradation_area": control_total_area,
+        "likely_null_result": likely_null_result,
         "reward_recovery_window_end": (
             total_metrics["first_recovery_idx"] + 1
             if total_metrics["first_recovery_idx"] is not None
@@ -360,15 +453,18 @@ def _score_fault_event(
         result["sort_degradation_area"] = sort_metrics["total_degradation_area"]
         result["sort_recovered"] = sort_metrics["recovered"]
         result["sort_first_recovery_step"] = sort_metrics["first_recovery_step"]
+        result["sort_degradation_area_corrected"] = sort_area_corrected
     else:
         result["sort_degradation_area"] = None
         result["sort_recovered"] = None
         result["sort_first_recovery_step"] = None
+        result["sort_degradation_area_corrected"] = None
 
     if press_metrics:
         result["press_degradation_area"] = press_metrics["total_degradation_area"]
         result["press_recovered"] = press_metrics["recovered"]
         result["press_first_recovery_step"] = press_metrics["first_recovery_step"]
+        result["press_degradation_area_corrected"] = press_area_corrected
     else:
         result["press_degradation_area"] = None
         result["press_recovered"] = None
@@ -638,16 +734,28 @@ def _safety_violations(
     }
 
 
-def _reaction_timing(detection_log, onset_step):
+def _reaction_timing(detection_log, onset_step, target=None):
     """
     Return the first post-onset detection/intervention step and latency.
 
     This is intentionally separate from performance recovery. The detection
     log used by the project marks whether sorting/pressing fault state was
     flagged at each step.
+
+    target : str or None
+        FIX (#4): only the channel(s) this fault actually targets are
+        checked. Previously this always OR'd sort+press together, so a
+        fault targeting only "sort" could be scored as reacted-to instantly
+        because the PRESS channel's detector fired for an unrelated reason
+        (e.g. its proactive container-fill-ratio check, which runs every
+        step regardless of any fault) - producing a reaction_latency of 0
+        that had nothing to do with this fault being detected at all.
     """
     if not detection_log:
         return {"reaction_step": None, "reaction_latency": None}
+
+    check_sort = target in (None, "sort", "both")
+    check_press = target in (None, "press", "both")
 
     onset = int(onset_step)
     first_step = None
@@ -662,7 +770,8 @@ def _reaction_timing(detection_log, onset_step):
             continue
 
         flagged = (
-            _intervention_flag(entry, "sort") or _intervention_flag(entry, "press")
+            (check_sort and _intervention_flag(entry, "sort"))
+            or (check_press and _intervention_flag(entry, "press"))
         )
         if flagged:
             first_step = step
@@ -677,179 +786,6 @@ def _reaction_timing(detection_log, onset_step):
     }
 
 
-# ---------------------------------------------------------*/
-# Composite benchmark score
-# ---------------------------------------------------------*/
-# PAPER-GRADE BENCHMARK SCORE — design rationale and formula
-# -----------------------------------------------------------
-#
-# WHY A SINGLE NUMBER?
-# --------------------
-# Cross-paradigm comparison (oracle rule-based vs. learned detector vs.
-# hierarchical supervisor) needs a common currency.  Raw episode reward is
-# incomparable across fault types because different faults inflict different
-# reward scales (sensor_noise may dip to ~-0.5/step, agent_dropout to ~-2.0).
-# A bounded [0, 100] score lets us report "mean ± std" across seeds and
-# fault types in one table.
-#
-# DESIGN PRINCIPLE
-# ----------------
-# The score is a *weighted penalty* converted to a bounded reward:
-#
-#     P  = Σ w_i · pen_i          (pen_i ∈ [0, 1], 0 = perfect)
-#     Score = 100 · (1 − clip(P, 0, 1))
-#
-# Each penalty term is *independently normalised* so that a fault type with
-# a large possible deficit does not automatically dominate the composite.
-# Normalisation uses the *fault-active window length* (onset → end), not the
-# episode length, so transient and permanent faults are comparable.
-#
-# COMPONENT PENALTIES  (each ∈ [0, 1], 0 = perfect)
-# ---------------------------------------------------
-#
-# 1. SAFETY PENALTY  —  safety_pen
-#    Captures container-overflow and quality/purity risk.  Catastrophic
-#    events (ratio > 1.0) are weighted highest because they represent the
-#    actual operational failure mode; severe and near-miss are scaled down.
-#
-#        safety_pen = clip( (5·N_cat + 2·N_sev + 1·N_near) / window_len , 0, 1)
-#
-#    The linear weighting (5 / 2 / 1) is chosen to reflect industrial
-#    safety-tier severity.  The cap at 1.0 prevents a single catastrophic
-#    episode from washing out all other signal.
-#
-# 2. REWARD-DEFICIT PENALTY  —  deficit_pen
-#    Measures how much reward was lost relative to the best-case baseline.
-#    Normalised by the *theoretical maximum deficit* so that a fault that
-#    could at worst drive reward to reward_floor does not score worse than
-#    a fault with a smaller floor just because the floor is lower.
-#
-#        max_deficit_per_step = pre_fault_baseline_reward − reward_floor
-#        deficit_pen = clip( cumulative_reward_deficit
-#                            / (max_deficit_per_step · window_len) , 0, 1)
-#
-#    reward_floor is the known minimum combined reward per step (e.g. -2
-#    for this environment).  If the baseline is below the floor the penalty
-#    is clamped to 0.
-#
-# 3. RELAPSE PENALTY  —  relapse_pen
-#    A mechanism that recovers once but relapses repeatedly is worse than
-#    one that sustains recovery.  This term directly measures that.
-#
-#        relapse_pen = 1 − fraction_time_healthy
-#
-#    fraction_time_healthy = steps_at_or_above_threshold_after_degradation
-#                            / window_len
-#
-#    If no degradation is ever detected, fraction_time_healthy = 1.0 and
-#    the penalty is 0 (the episode was trivially healthy).
-#
-# 4. TIME-TO-RECOVERY PENALTY  —  ttr_pen
-#    Latency to the *first* confirmed recovery.  If recovery never occurs
-#    the penalty is the maximum 1.0.
-#
-#        ttr_pen = clip( time_to_first_recovery / window_len , 0, 1)   [if recovered]
-#        ttr_pen = 1.0                                                   [otherwise]
-#
-#    Using first recovery (not sustained recovery) keeps the penalty
-#    monotonic: a later first recovery can only increase the penalty, never
-#    decrease it.
-#
-# COMPOSITE FORMULA
-# -----------------
-# Let the weights be w_safety, w_deficit, w_relapse, w_ttr (summing to 1.0
-# for interpretability, though the code does not enforce this).
-#
-#        P = w_safety · safety_pen
-#          + w_deficit · deficit_pen
-#          + w_relapse · relapse_pen
-#          + w_ttr     · ttr_pen
-#
-#        Benchmark Score = 100 × (1 − clip(P, 0, 1))
-#
-# DEFAULT WEIGHTS (industrial-safety-flavoured)
-# ---------------------------------------------
-#        safety  = 0.40   # highest: physical/operational failure matters most
-#        deficit = 0.25   # economic cost of lost throughput
-#        relapse = 0.20   # stability of the recovery
-#        ttr     = 0.15   # speed of initial response
-#
-# These weights are a *knob* — they should be stated explicitly in the
-# paper, and a sensitivity check (e.g. uniform 0.25 weights, or safety=0.6)
-# should be reported as a robustness line in the results table.
-#
-# WHY PRECISION / RECALL ARE EXCLUDED
-# -----------------------------------
-# Intervention precision (false-positive rate) and recall are reported
-# *alongside* the score, not folded into it.  Including them would double-
-# count the same underlying effect: a mechanism with low recall that never
-# intervenes will already score badly on safety, deficit, and relapse because
-# the fault goes unmitigated.  Precision/recall explain *why* a mechanism
-# scored well or badly; the composite score captures the *outcome*.
-#
-# AGGREGATION
-# -----------
-# For the actual cross-paradigm comparison, run each
-# (fault_type × mechanism) cell over multiple seeds and report
-#
-#        mean(Score) ± std(Score)
-#
-# A single seed (e.g. seed=42) is one sample from a noisy stochastic
-# process; the composite is only trustworthy when aggregated.
-# -----------------------------------------------------------
-
-def _compute_benchmark_score(
-    event,
-    reward_floor=-2.0,
-    weights=None,
-):
-    """
-    Convert per-event outcome metrics into a single bounded benchmark score.
-
-    See the extended comment block above for the full design rationale,
-    normalisation strategy, and sensitivity-check guidance.
-    """
-    if weights is None:
-        weights = {"safety": 0.40, "deficit": 0.25, "relapse": 0.20, "ttr": 0.15}
-
-    window_len = event.get("fault_active_window_end", 0) - event.get("onset_step", 0)
-    if window_len <= 0:
-        return None
-
-    safety = event.get("safety", {})
-    cat = safety.get("catastrophic_count", 0)
-    sev = safety.get("severe_count", 0)
-    near = safety.get("near_miss_count", 0)
-    safety_pen = min(1.0, (5 * cat + 2 * sev + 1 * near) / window_len)
-
-    baseline = event.get("pre_fault_baseline_reward", 0.0)
-    max_deficit_per_step = max(0.0, baseline - reward_floor)
-    total_deficit = event.get("cumulative_reward_deficit", 0.0)
-    if max_deficit_per_step > 0 and window_len > 0:
-        deficit_pen = min(1.0, total_deficit / (max_deficit_per_step * window_len))
-    else:
-        deficit_pen = 0.0
-
-    frac_healthy = event.get("fraction_time_healthy")
-    if frac_healthy is None:
-        frac_healthy = 1.0
-    relapse_pen = 1.0 - frac_healthy
-
-    if event.get("recovered", False):
-        ttr = event.get("time_to_first_recovery", window_len)
-        ttr_pen = min(1.0, ttr / window_len)
-    else:
-        ttr_pen = 1.0
-
-    P = (
-        weights.get("safety", 0.0) * safety_pen
-        + weights.get("deficit", 0.0) * deficit_pen
-        + weights.get("relapse", 0.0) * relapse_pen
-        + weights.get("ttr", 0.0) * ttr_pen
-    )
-
-    score = 100 * (1.0 - max(0.0, min(1.0, P)))
-    return round(score, 4)
 # ---------------------------------------------------------*/
 # Public entry point
 # ---------------------------------------------------------*/
@@ -867,8 +803,8 @@ def compute_recovery_metrics(
     severe_ratio=0.95,
     quality_near_miss_threshold=0.90,
     quality_severe_threshold=0.80,
-    reward_floor=-2.0,
-    benchmark_weights=None,
+    control_reward_data=None,
+    null_result_epsilon=2.0,
 ):
     """
     Compute all recovery metrics for the completed episode in `env`.
@@ -882,12 +818,18 @@ def compute_recovery_metrics(
     cold_start_steps : int
         Number of initial episode steps excluded from the pre-fault baseline
         (reward is often near-zero during ramp-up).
-    reward_floor : float
-        Minimum possible reward per step, used to normalize the deficit
-        penalty in the benchmark score.
-    benchmark_weights : dict or None
-        Weights for the composite score. Defaults to
-        {"safety": 0.40, "deficit": 0.25, "relapse": 0.20, "ttr": 0.15}.
+    control_reward_data : dict or None
+        `reward_data` from a matching NO-FAULT control episode (same seed,
+        same agent weights, same episode length as `env`). When given,
+        every fault event also gets null-corrected degradation-area fields
+        (see _score_fault_event) that subtract out the control episode's
+        own natural non-stationary-reward pattern, rather than reporting
+        raw degradation area that conflates real fault effects with normal
+        episode dynamics.
+    null_result_epsilon : float
+        Corrected-degradation-area threshold below which a fault event is
+        flagged "likely_null_result" - i.e. not distinguishable from the
+        no-fault control run's own natural variance.
     """
     reward_data = getattr(env, "reward_data", {}) or {}
     fault_log = getattr(env, "fault_log", []) or []
@@ -899,6 +841,11 @@ def compute_recovery_metrics(
     total_series = _total_reward_series(reward_data)
     sort_series, press_series = _channel_reward_series(reward_data)
 
+    control_total_series = control_sort_series = control_press_series = None
+    if control_reward_data:
+        control_total_series = _total_reward_series(control_reward_data)
+        control_sort_series, control_press_series = _channel_reward_series(control_reward_data)
+
     if required_healthy_steps is None:
         required_healthy_steps = max(1, int(rolling_window)) * max(1, int(sustain_windows))
 
@@ -906,6 +853,7 @@ def compute_recovery_metrics(
     for event in fault_log:
         onset = event.get("onset_step", 0)
         duration = event.get("duration")
+        target = event.get("target")
 
         scored = _score_fault_event(
             total_series,
@@ -916,6 +864,11 @@ def compute_recovery_metrics(
             recovery_tolerance,
             required_healthy_steps,
             cold_start_steps,
+            target=target,
+            control_total_series=control_total_series,
+            control_sort_series=control_sort_series,
+            control_press_series=control_press_series,
+            null_result_epsilon=null_result_epsilon,
         )
 
         # Safety is scored over the complete fault-active window, independently
@@ -934,11 +887,30 @@ def compute_recovery_metrics(
             quality_near_miss_threshold,
             quality_severe_threshold,
         )
-        scored.update(_reaction_timing(detection_log, scored["onset_step"]))
+        scored.update(_reaction_timing(detection_log, scored["onset_step"], target=target))
         scored["fault_type"] = event.get("type")
-        scored["benchmark_score"] = _compute_benchmark_score(
-            scored, reward_floor, benchmark_weights
+
+        # The matching no-fault control episode's own safety-violation
+        # counts, over the identical window - lets a downstream aggregator
+        # compute an excess-safety-violations metric (fault run's counts
+        # minus this) instead of reading the fault run's raw count as if it
+        # were entirely fault-caused (see aggregate_benchmark_scores.py).
+        scored["control_safety"] = (
+            _safety_violations(
+                control_reward_data or {},
+                material_names,
+                container_max,
+                container_global_max,
+                scored["onset_step"],
+                scored["fault_active_window_end"],
+                near_miss_ratio,
+                severe_ratio,
+                quality_near_miss_threshold,
+                quality_severe_threshold,
+            )
+            if control_total_series else None
         )
+
         per_event.append(scored)
 
     intervention_scores = _intervention_scoring(detection_log)
@@ -1010,15 +982,16 @@ def print_recovery_metrics(metrics):
         print(f"    sustained recovery   : {ev.get('sustained_recovery')}")
         print(f"    relapse count        : {ev.get('relapse_count')}")
         print(f"    fraction time healthy: {ev.get('fraction_time_healthy')}")
-        print(f"    total degradation area : {ev['total_degradation_area']}")
+        print(f"    total degradation area : {ev['total_degradation_area']}"
+              f"  (corrected: {ev.get('total_degradation_area_corrected')})")
         print(f"    cumulative reward deficit : {ev['cumulative_reward_deficit']}")
+        if ev.get("likely_null_result"):
+            print(f"    likely_null_result   : True (fault's effect is within the no-fault control's own noise)")
 
         if ev.get("sort_degradation_area") is not None:
             print(f"    sort degradation area: {ev['sort_degradation_area']} (recovered: {ev['sort_recovered']})")
         if ev.get("press_degradation_area") is not None:
             print(f"    press degradation area: {ev['press_degradation_area']} (recovered: {ev['press_recovered']})")
-
-        print(f"    benchmark score      : {ev.get('benchmark_score')}")
 
         safety = ev["safety"]
         fault_window_end = ev["fault_active_window_end"]

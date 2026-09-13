@@ -213,3 +213,8 @@ __marimo__/
 # LLM Evaluation
 faultbench_report.txt
 log/recovery_metrics.jsonl
+
+# TensorBoard training-run logs - training curves, not needed to reproduce
+# the published sweep results (those come from the models + sweep jsonl).
+log/tensorboard/*
+!log/tensorboard/.gitkeep

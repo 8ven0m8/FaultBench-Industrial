@@ -20,8 +20,12 @@
 #   - "actuator_degradation"  (self): the press action this policy chose is
 #                              corrupted before being applied - "stuck"
 #                              (frozen at the first chosen action for the
-#                              window) or "slip" (replaced by a random
-#                              action with some probability each step).
+#                              window), "restrict" (one press id becomes
+#                              permanently unreachable for the window - the
+#                              action downgrades to a no-op whenever it
+#                              targets that press), or "slip" (replaced by
+#                              a random action with some probability each
+#                              step).
 #   - "teammate_dropout"      : self.sort_agent.predict() is skipped
 #                              entirely; a fixed failsafe sort_mode is used
 #                              instead, simulating a silent/dropped sorting
@@ -75,7 +79,7 @@ _SORTER_AMOUNTS_SLICE = slice(10, 14)
 
 
 class Env_2_Pressing_FaultTolerant(Env_2_Pressing):
-    FAULT_PROB = 0.30
+    FAULT_PROB = 0.40
     TRANSIENT_PROB = 0.70
     TRANSIENT_DURATION_RANGE = (10, 40)
     INJECTION_STEP_RANGE = (20, 120)
@@ -86,7 +90,7 @@ class Env_2_Pressing_FaultTolerant(Env_2_Pressing):
     ]
 
     SENSOR_NOISE_STD = 0.08
-    ACTUATOR_MODE_CHOICES = ("stuck", "slip")
+    ACTUATOR_MODE_CHOICES = ("stuck", "restrict", "slip")
     ACTUATOR_SLIP_PROB = 0.30
     DROPOUT_SORT_MODE = 0  # fixed failsafe sort mode used while "teammate dropped"
 
@@ -101,6 +105,7 @@ class Env_2_Pressing_FaultTolerant(Env_2_Pressing):
         self._duration = None
         self._latched_press_action = None
         self._latched_actuator_mode = None
+        self._latched_restrict_press_id = None
         self._episode_byzantine_mode = None
         self._latched_byzantine_sort_mode = None
         self._episode_comms_mode = None
@@ -125,6 +130,7 @@ class Env_2_Pressing_FaultTolerant(Env_2_Pressing):
 
         self._latched_press_action = None
         self._latched_actuator_mode = None
+        self._latched_restrict_press_id = None
 
         self._episode_byzantine_mode = None
         self._latched_byzantine_sort_mode = None
@@ -214,12 +220,19 @@ class Env_2_Pressing_FaultTolerant(Env_2_Pressing):
                 if self._latched_press_action is None:
                     self._latched_press_action = chosen_action
                 chosen_action = self._latched_press_action
+            elif self._latched_actuator_mode == "restrict":
+                if self._latched_restrict_press_id is None:
+                    self._latched_restrict_press_id = int(self._fault_rng.choice([1, 2]))
+                broken_press_id, _ = super().press_discrete_to_action(chosen_action)
+                if broken_press_id == self._latched_restrict_press_id:
+                    chosen_action = 0  # commanded press is down -> action downgraded to no-op
             else:  # "slip"
                 if self._fault_rng.random() < self.ACTUATOR_SLIP_PROB:
                     chosen_action = int(self._fault_rng.integers(0, 11))
         else:
             self._latched_press_action = None
             self._latched_actuator_mode = None
+            self._latched_restrict_press_id = None
 
         if not use_action_masking:
             sanitized_action, press_action_tuple, invalid_info = super().sanitize_press_action(chosen_action)

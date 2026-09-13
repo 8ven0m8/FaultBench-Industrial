@@ -10,11 +10,24 @@ prompts at module level and would block/misbehave on import. The registry
 wiring below is copied from main.py's own imports/dicts; if you add a new
 fault type or recovery mechanism there, mirror it here too.
 
-Usage: python sanity_check.py
+Usage: python evaluation/verify_workings.py (run from the repo root)
 Tip: set RUN_LLM_CHECKS = False while iterating on everything else, then
 flip it back on for a final pass -- llm_replanning makes real API calls.
 """
 import os
+import sys
+
+# This file lives in evaluation/, one level below the repo root. Anchor
+# BOTH imports (sys.path) AND every relative path this file and everything
+# it imports uses (./models, config.yml, find_latest_model's "./models"
+# scan, .env lookup, ...) to the repo root via chdir - not just sys.path -
+# so this works whether invoked from the repo root, from inside
+# evaluation/, or from an IDE that defaults cwd to the script's own
+# directory. Done before any other import, including load_dotenv() below.
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, _REPO_ROOT)
+os.chdir(_REPO_ROOT)
+
 import numpy as np
 from stable_baselines3 import PPO
 
@@ -252,7 +265,8 @@ for duration_mode in DURATION_MODES:
 
 # ---------------------------------------------------------------------------
 # Phase 3 -- oracle (rule_based) invariants: false-positive rate ~0, and
-# benchmark score should not be worse than doing nothing. Both duration modes.
+# corrected degradation-area (lower = better) should not be worse than
+# doing nothing. Both duration modes.
 # ---------------------------------------------------------------------------
 print()
 print("=" * 90)
@@ -261,7 +275,7 @@ print("=" * 90)
 for duration_mode in DURATION_MODES:
     print(f"\n  -- {duration_mode} --")
     for fault_name in FAULT_CLASSES:
-        fps, none_scores, oracle_scores = [], [], []
+        fps, none_degradation, oracle_degradation = [], [], []
         for seed in range(N_SEEDS_STANDARD):
             env_o, err_o = run_episode(fault_name, "rule_based", duration_mode, seed)
             if env_o is None:
@@ -272,8 +286,8 @@ for duration_mode in DURATION_MODES:
             if fp is not None:
                 fps.append(fp)
             for ev in m_o.get("fault_events", []):
-                if ev.get("benchmark_score") is not None:
-                    oracle_scores.append(ev["benchmark_score"])
+                if ev.get("total_degradation_area") is not None:
+                    oracle_degradation.append(ev["total_degradation_area"])
 
             env_n, err_n = run_episode(fault_name, "none", duration_mode, seed)
             if env_n is None:
@@ -281,15 +295,18 @@ for duration_mode in DURATION_MODES:
                 continue
             m_n = compute_recovery_metrics(env_n, fault_mode=fault_name, recovery_mode="none", seed=seed)
             for ev in m_n.get("fault_events", []):
-                if ev.get("benchmark_score") is not None:
-                    none_scores.append(ev["benchmark_score"])
+                if ev.get("total_degradation_area") is not None:
+                    none_degradation.append(ev["total_degradation_area"])
 
         bad_fp = [fp for fp in fps if fp > 1e-6]
-        mean_none = np.mean(none_scores) if none_scores else float("nan")
-        mean_oracle = np.mean(oracle_scores) if oracle_scores else float("nan")
-        beats_none = mean_oracle >= mean_none - 1.0
-        print(f"    {fault_name:22s} fp={fps}  none={mean_none:.2f}  oracle={mean_oracle:.2f}  "
-              f"{'OK' if not bad_fp and beats_none else 'CHECK'}")
+        mean_none = np.mean(none_degradation) if none_degradation else float("nan")
+        mean_oracle = np.mean(oracle_degradation) if oracle_degradation else float("nan")
+        # Lower degradation-area is better - oracle shouldn't cause MORE
+        # damage than doing nothing, within a small tolerance (matches
+        # null_result_epsilon's convention elsewhere in the codebase).
+        beats_none = mean_oracle <= mean_none + 2.0
+        print(f"    {fault_name:22s} fp={fps}  none_degradation={mean_none:.2f}  "
+              f"oracle_degradation={mean_oracle:.2f}  {'OK' if not bad_fp and beats_none else 'CHECK'}")
         if bad_fp:
             flag(f"{fault_name}/{duration_mode}: oracle has nonzero false-positive rate {bad_fp}")
         if not beats_none:
@@ -299,9 +316,9 @@ for duration_mode in DURATION_MODES:
             # not a hard failure, and investigate before writing it up: check
             # whether the corrective action (e.g. check_container_level()) is
             # producing off-bale-multiple presses during the override window.
-            flag(f"{fault_name}/{duration_mode}: oracle rule_based scores worse than no-recovery "
-                 f"(none={mean_none:.2f} vs oracle={mean_oracle:.2f}) -- verify this is a real "
-                 f"characteristic of the heuristic, not a bug, before reporting it", hard=False)
+            flag(f"{fault_name}/{duration_mode}: oracle rule_based causes MORE degradation than "
+                 f"no-recovery (none={mean_none:.2f} vs oracle={mean_oracle:.2f}) -- verify this is "
+                 f"a real characteristic of the heuristic, not a bug, before reporting it", hard=False)
 
 # ---------------------------------------------------------------------------
 # Phase 4 -- rule_based_detect: informational precision/recall per fault type,
@@ -331,8 +348,10 @@ print("   near-zero recall is EXPECTED for fault types that don't really touch a
 # ---------------------------------------------------------------------------
 # Phase 5 -- full matrix smoke test: every fault x every recovery mode x both
 # duration modes actually runs without crashing, with sane (non-NaN) output.
-# This is the "compare them all" pass -- prints a benchmark_score grid you
-# can eyeball before committing to the full multi-seed run.
+# This is the "compare them all" pass -- prints a degradation-area grid
+# (lower = better; raw, not null-corrected, since this smoke test doesn't
+# thread a control run through) you can eyeball before committing to the
+# full multi-seed run.
 # ---------------------------------------------------------------------------
 if RUN_FULL_MATRIX_SMOKE_TEST:
     print()
@@ -363,11 +382,11 @@ if RUN_FULL_MATRIX_SMOKE_TEST:
                         break
                     m = compute_recovery_metrics(env, fault_mode=fault_name, recovery_mode=recovery_mode, seed=seed)
                     for ev in m.get("fault_events", []):
-                        bs = ev.get("benchmark_score")
-                        if bs is None or not np.isfinite(bs):
-                            flag(f"{fault_name}/{duration_mode}/{recovery_mode}/seed{seed}: benchmark_score is {bs}")
+                        da = ev.get("total_degradation_area")
+                        if da is None or not np.isfinite(da):
+                            flag(f"{fault_name}/{duration_mode}/{recovery_mode}/seed{seed}: total_degradation_area is {da}")
                         else:
-                            scores.append(bs)
+                            scores.append(da)
                     # Episode-length check
                     total_len = len(env.reward_data.get("Reward", []))
                     if total_len < STEPS:

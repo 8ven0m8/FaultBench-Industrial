@@ -42,13 +42,13 @@ from src.envs_train.env_1_sort import Env_1_Sorting
 
 
 class Env_1_Sorting_FaultTolerant(Env_1_Sorting):
-    FAULT_PROB = 0.30                  # fraction of training episodes that get a fault at all
+    FAULT_PROB = 0.40                  # fraction of training episodes that get a fault at all
     TRANSIENT_PROB = 0.70              # of faulted episodes, fraction transient vs permanent
     TRANSIENT_DURATION_RANGE = (10, 40)
     INJECTION_STEP_RANGE = (20, 120)   # out of a 200-step training episode
 
     SENSOR_NOISE_STD = 0.08
-    ACTUATOR_MODE_CHOICES = ("stuck", "slip")
+    ACTUATOR_MODE_CHOICES = ("stuck", "restrict", "slip")
     ACTUATOR_SLIP_PROB = 0.30
 
     def __init__(self, *args, seed=None, **kwargs):
@@ -59,6 +59,7 @@ class Env_1_Sorting_FaultTolerant(Env_1_Sorting):
         self._duration = None
         self._latched_sort_mode = None
         self._latched_actuator_mode = None
+        self._latched_restrict_mode = None
 
     def reset(self, seed=None):
         obs, info = super().reset(seed=seed)
@@ -79,6 +80,7 @@ class Env_1_Sorting_FaultTolerant(Env_1_Sorting):
 
         self._latched_sort_mode = None
         self._latched_actuator_mode = None
+        self._latched_restrict_mode = None
         return self._maybe_corrupt_obs(obs), info
 
     def _fault_active(self):
@@ -106,12 +108,18 @@ class Env_1_Sorting_FaultTolerant(Env_1_Sorting):
                 if self._latched_sort_mode is None:
                     self._latched_sort_mode = action
                 action = self._latched_sort_mode
+            elif self._latched_actuator_mode == "restrict":
+                if self._latched_restrict_mode is None:
+                    self._latched_restrict_mode = int(self._fault_rng.choice([0, 1]))
+                if int(action) == self._latched_restrict_mode:
+                    action = 1 - self._latched_restrict_mode
             else:  # "slip"
                 if self._fault_rng.random() < self.ACTUATOR_SLIP_PROB:
                     action = 1 - int(action)
         else:
             self._latched_sort_mode = None
             self._latched_actuator_mode = None
+            self._latched_restrict_mode = None
 
         obs, reward, terminated, truncated, info = super().step(
             action=action, use_action_masking=use_action_masking, check_overflow=check_overflow

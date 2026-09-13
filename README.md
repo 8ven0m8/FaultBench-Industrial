@@ -58,7 +58,7 @@ The current fault suite contains five fault classes:
 
 Each fault can be configured as either **permanent** or **transient**.
 Fault injection occurs within a configurable random onset window,
-currently `40–60` steps by default.
+currently `40-60` steps by default.
 
 ## Recovery Mechanisms
 
@@ -110,7 +110,6 @@ At a high level:
 
 <img src="flowchart.png" alt="Flowchart" width="700">
 
-
 ## Installation
 
 Create and activate the project environment, then install the project's
@@ -119,8 +118,8 @@ Python dependencies.
 For example:
 
 ``` bash
-git clone <repository-url>
-cd MARL-Env-FI-and-recovery
+git clone https://github.com/8ven0m8/FaultBench-Industrial.git
+cd FaultBench-Industrial
 
 python -m venv .venv
 source .venv/bin/activate
@@ -380,7 +379,6 @@ Set it in the environment:
 export OPENAI_API_KEY="your-key"
 ```
 
-
 The implementation records, for each LLM decision:
 
 -   decision step
@@ -405,14 +403,14 @@ SEED = 42
 and faults are injected within:
 
 ``` text
-40–60 steps
+40-60 steps
 ```
 
 The verification harness should be run before reporting experimental
 results.
 
 ``` bash
-python verify_workings.py
+python evaluation/verify_workings.py
 ```
 
 A successful verification should report:
@@ -446,47 +444,56 @@ The research proposal identifies three secondary questions:
 -   Does a single recovery paradigm dominate across all fault classes?
 -   Is there a recovery-speed versus safety trade-off?
 -   How does recovery overhead scale as simultaneous faults increase?
-
-fileciteturn0file1L9-L14
+    (not addressed by the current results - see Results below)
 
 The broader intended contribution is a reusable fault-injection
 benchmark and an empirical comparison of recovery mechanisms on a common
-industrial-flavored MARL testbed. fileciteturn0file1L17-L27
+industrial-flavored MARL testbed.
 
 ## Results
 
-The final experimental analysis should report results across multiple
-seeds and preferably include confidence intervals and effect sizes.
+The full sweep ran every (fault type x duration x recovery mechanism)
+combination across 8 seeds, with 95% confidence intervals and Glass's
+delta effect sizes computed against the no-recovery baseline. The
+complete breakdown - all 30 faceted charts, per-fault findings, and
+effect-size tables - is on the
+[results page of the project website](https://faultbench.pranjalsapkota.com/results.html).
+A few headline results:
 
-Recommended primary result tables:
+**Doing nothing is dangerous against severe faults.** For agent dropout,
+`none` and `fault_tolerant_marl` are statistically indistinguishable and
+both accumulate roughly **17x** the weighted safety-violation excess of
+`rule_based` (~1052 vs. ~61, Glass's delta = -0.93, a large effect). This
+is the strongest, most defensible result in the suite: for faults that
+fully compromise an agent's decision-making, leaving them uncorrected
+isn't just suboptimal, it's measurably unsafe.
 
-### Overall recovery comparison
+<img src="img/figures/benchmarks/aggregate_faceted__agent_dropout__safety_excess.png" alt="Weighted safety-violation excess by target and duration, agent dropout, all six recovery mechanisms" width="800">
 
-``` text
-Mechanism × Metric
-```
+**Fault-tolerant training doesn't transfer to every fault class.**
+Against actuator degradation, `fault_tolerant_marl` tracks `none` almost
+exactly on corrected degradation-area (46.4 vs. 45.4, delta = +0.02 -
+essentially no effect), while every detection- or oracle-based mechanism
+beats both by a wide margin. Domain-randomized robustness training is not
+a substitute for actively detecting and reacting to a fault.
 
-### Fault-specific comparison
+<img src="img/figures/benchmarks/aggregate_faceted__actuator_degradation__degradation_area.png" alt="Corrected degradation-area by target and duration, actuator degradation, all six recovery mechanisms" width="800">
 
-``` text
-Fault × Mechanism × Metric
-```
+**The best mechanism is fault-dependent, not universal.** Communication
+loss is the one fault class where `fault_tolerant_marl` outright wins
+(6.3 mean degradation-area vs. 21.9 for `none`), rather than tying it as
+it does everywhere else - consistent with this being the mildest,
+most partial-information fault tested. No single recovery paradigm
+dominates across the whole suite (see RQ1 above).
 
-### Duration comparison
+<img src="img/figures/benchmarks/aggregate_faceted__comms_loss__degradation_area.png" alt="Corrected degradation-area by duration, communication loss, all six recovery mechanisms" width="800">
 
-``` text
-Permanent vs. Transient
-```
-
-### Trade-off analysis
-
-``` text
-Recovery speed vs. degradation area
-Recovery speed vs. safety violations
-```
-
-The research proposal recommends multiple random seeds rather than
-relying on single-run results.
+Time-to-recovery was evaluated and dropped from the final comparison - it
+is only meaningful over events that both recovered and were not a null
+result, and that qualifying subset differs enormously in composition
+between mechanisms (see the
+[metric glossary](https://faultbench.pranjalsapkota.com/results.html#glossary)
+on the results page for the full reasoning).
 
 ## Research Goal
 
@@ -513,6 +520,6 @@ Tom Maus, Asma Atamna and Tobias Glasmachers (2025). [*Balancing Specialization 
 **Original Repository:**  
 [Storm-131/MARL-SortingEnv](https://github.com/Storm-131/MARL-SortingEnv)
 
-The original repository is licensed under the MIT License. :contentReference[oaicite:2]{index=2}
+The original repository is licensed under the MIT License.
 
 ------------------------------------------------------------------------
