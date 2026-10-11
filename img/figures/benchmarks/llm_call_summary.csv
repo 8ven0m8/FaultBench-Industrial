@@ -1,0 +1,8 @@
+fault_mode,n_runs,n_calls,calls_per_run,n_errors,error_rate,mean_latency_ms,median_latency_ms,models,input_tokens,output_tokens
+actuator_degradation,144,1344,9.33,0,0.0,1494.0,1436.4,gpt-4o-mini-2024-07-18,1652957,100710
+agent_dropout,48,504,10.5,0,0.0,1485.2,1430.1,gpt-4o-mini-2024-07-18,621097,38159
+byzantine,144,1794,12.46,0,0.0,1491.1,1435.7,gpt-4o-mini-2024-07-18,2217767,134137
+comms_loss,32,257,8.03,0,0.0,1526.8,1447.6,gpt-4o-mini-2024-07-18,315268,19335
+control,14,79,5.64,0,0.0,1418.2,1369.7,gpt-4o-mini-2024-07-18,96118,5868
+sensor_noise,48,439,9.15,0,0.0,1436.4,1418.5,gpt-4o-mini-2024-07-18,539794,32806
+ALL,430,4417,10.27,0,0.0,1486.6,1434.3,gpt-4o-mini-2024-07-18,5443001,331015

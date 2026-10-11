@@ -203,6 +203,9 @@ class LLMRecoveryMixin(DetectionRequiredRuleBasedMixin):
                 "sort_mode": decision["sort_mode"], "press_id": decision["press_id"],
                 "material": decision["material"], "reasoning": decision["reasoning"],
                 "latency_ms": decision["latency_ms"], "error": decision["error"],
+                "model": decision.get("model"),
+                "input_tokens": decision.get("input_tokens", 0),
+                "output_tokens": decision.get("output_tokens", 0),
                 "sort_suspected": sort_suspected, "press_suspected": press_suspected,
             })
 

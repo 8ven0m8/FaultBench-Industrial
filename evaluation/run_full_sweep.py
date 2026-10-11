@@ -64,9 +64,13 @@
 # --transient-duration INT     default 20. Fixed step-count for transient
 #                               faults, matches main.py's
 #                               DEFAULT_TRANSIENT_DURATION.
-# --save-plots                 off by default. Turns on test_env's
-#                               matplotlib save (312 plot files if left on
-#                               for the full grid).
+# --save-plots                 off by default. Saves one reward/fill
+#                               plot per run as SVG to --plot-dir, named
+#                               "Sweep_<date>_<run_id>_env_simulation.svg"
+#                               (~4,170 files, roughly 2 GB, for the full
+#                               grid incl. training-seed replicates and
+#                               --include-baseline). Without it, no per-run
+#                               plots are written at all.
 # --plot-dir STR                default "./img/figures/sweep/". Where those
 #                               plots go if --save-plots is enabled.
 # --log-path STR                default "./log/recovery_metrics_sweep.jsonl".
@@ -85,6 +89,26 @@
 # --dry-run                    off by default. Prints every combo's run_id
 #                               and the total count, runs nothing.
 # --include-baseline          # + one clean no-fault/no-recovery run
+# --train-seeds STR             default "auto". Which TRAINING-seed replicates
+#                               of fault_tolerant_marl / supervisor to
+#                               evaluate (see train_seeds.py). "auto" = every
+#                               "_ts<k>" checkpoint found in ./models (falls
+#                               back to the legacy single-seed checkpoint if
+#                               there are none); "legacy" = only the legacy
+#                               checkpoint; or a comma list like 1,2,3. Each
+#                               replicate is a separate run (run_id gets a
+#                               __ts<k> part), so those two mechanisms run
+#                               (#replicates) x --seeds times per combo.
+# --allow-llm-base-url          off by default. llm_replanning refuses to run
+#                               while MARL_LLM_BASE_URL is set (i.e. against a
+#                               proxy/auto-router instead of OpenAI itself),
+#                               because the paper needs a known model. Pass
+#                               this to run against a proxy anyway.
+#
+# Every llm_replanning record also carries its per-call llm_decision_log
+# (action, reasoning, latency, error, served model, tokens) plus an
+# llm_summary, and each LLM control episode is logged as its own
+# status="control" record so its API calls are accounted for too.
 #
 # Duration is one of the five swept axes, not an afterthought: every combo
 # is fault x target x duration_type x fault-specific mode x recovery, and
@@ -133,7 +157,11 @@ from src.recovery.supervisor import SUPERVISOR_REGISTRY
 from src.recovery.llm_replanning import LLM_REGISTRY
 
 from src.testing import test_env
-from src.training import find_latest_model
+from src.model_paths import (
+    VANILLA_SORT_PATH, VANILLA_PRESS_PATH, find_ft_pair, find_supervisor,
+    available_ft_train_seeds, available_supervisor_train_seeds,
+)
+from src.recovery.llm_agent import llm_endpoint_description
 from utils.metrics import compute_recovery_metrics, print_recovery_metrics
 
 FAULT_REGISTRY = {
@@ -155,6 +183,10 @@ ALL_FAULTS = ["sensor_noise", "actuator_degradation", "agent_dropout", "comms_lo
 ALL_RECOVERIES = ["none", "rule_based", "rule_based_detect", "fault_tolerant_marl", "supervisor", "llm_replanning"]
 ALL_TARGETS = ["sort", "press", "both"]
 ALL_DURATIONS = ["transient", "permanent"]
+
+# Mechanisms that are themselves trained policies, evaluated once per
+# training-seed replicate (see train_seeds.py / --train-seeds).
+SEEDED_RECOVERIES = ("fault_tolerant_marl", "supervisor")
 
 # fault-specific categorical modes; None = fault type has no extra mode axis
 FAULT_MODE_AXIS = {
@@ -215,13 +247,51 @@ def build_combos(faults, recoveries, targets, durations, include_noop_comms_targ
                 }
 
 
-def combo_run_id(c, seed_index=None):
+def combo_run_id(c, seed_index=None, train_seed=None):
     mode_part = f"__{c['mode_key']}-{c['mode_value']}" if c["mode_key"] else ""
+    ts_part = f"__ts{train_seed}" if train_seed is not None else ""
     seed_part = f"__seed{seed_index}" if seed_index is not None else ""
     return (
         f"{c['fault']}__target-{c['target']}__dur-{c['duration_type']}"
-        f"{mode_part}__recovery-{c['recovery']}{seed_part}"
+        f"{mode_part}__recovery-{c['recovery']}{ts_part}{seed_part}"
     )
+
+
+def resolve_train_seeds(spec):
+    """--train-seeds -> {recovery_mode: [train_seed, ...]}. None in a list
+    means the legacy single-seed checkpoint."""
+    spec = spec.strip().lower()
+    if spec == "auto":
+        return {
+            "fault_tolerant_marl": available_ft_train_seeds() or [None],
+            "supervisor": available_supervisor_train_seeds() or [None],
+        }
+    if spec == "legacy":
+        return {"fault_tolerant_marl": [None], "supervisor": [None]}
+    seeds = [int(x) for x in spec.split(",") if x.strip()]
+    return {"fault_tolerant_marl": seeds, "supervisor": seeds}
+
+
+def summarize_llm_log(log):
+    """Per-run rollup of an llm_decision_log, so the paper can report the
+    real success rate, latency, served model and token cost."""
+    log = log or []
+    errors = [d for d in log if d.get("error")]
+    ok_latencies = [d["latency_ms"] for d in log if not d.get("error") and d.get("latency_ms") is not None]
+    actions = {}
+    for d in log:
+        actions[d.get("action")] = actions.get(d.get("action"), 0) + 1
+    return {
+        "n_calls": len(log),
+        "n_errors": len(errors),
+        "error_rate": round(len(errors) / len(log), 4) if log else None,
+        "mean_latency_ms": round(sum(ok_latencies) / len(ok_latencies), 1) if ok_latencies else None,
+        "models": sorted({d["model"] for d in log if d.get("model")}),
+        "input_tokens": sum(d.get("input_tokens", 0) or 0 for d in log),
+        "output_tokens": sum(d.get("output_tokens", 0) or 0 for d in log),
+        "actions": actions,
+        "errors": sorted({d["error"] for d in errors})[:5],
+    }
 
 
 def derive_trial_seeds(base_seed, seed_index):
@@ -308,41 +378,56 @@ class ModelCache:
         from stable_baselines3 import PPO
         self.PPO = PPO
         self._cache = {}
-        self._supervisor = None
-        self._supervisor_loaded = False
+        self._paths = {}
+        self._supervisors = {}
+        self._supervisor_paths = {}
         self._control_reward_data = {}
         self._wrapped_control_reward_data = {}
+        # Extra JSONL records produced as a side effect (currently: the LLM
+        # control episode's own API calls). main() flushes these to the log.
+        self.pending_records = []
 
-    def sort_press(self, fault_tolerant):
-        key = "ft" if fault_tolerant else "vanilla"
+    def sort_press(self, fault_tolerant, train_seed=None):
+        """train_seed only matters for fault_tolerant=True; the vanilla pair
+        is a single checkpoint shared by every other mechanism."""
+        key = ("ft", train_seed) if fault_tolerant else "vanilla"
         if key not in self._cache:
             if fault_tolerant:
-                sort_path = "./models/PPO_Sorting_FaultTolerant_NoMask_10000000.zip"
-                press_path = "./models/PPO_Pressing_FaultTolerant_NoMask_10000000.zip"
+                paths = find_ft_pair(train_seed)
             else:
-                sort_path = "./models/PPO_Sorting_NoMask_10000000.zip"
-                press_path = "./models/PPO_Pressing_NoMask_10000000.zip"
-            if not (os.path.exists(sort_path) and os.path.exists(press_path)):
-                self._cache[key] = None
-            else:
-                self._cache[key] = (self.PPO.load(sort_path), self.PPO.load(press_path))
+                paths = (VANILLA_SORT_PATH, VANILLA_PRESS_PATH)
+                if not all(os.path.exists(p) for p in paths):
+                    paths = None
+            self._paths[key] = paths
+            self._cache[key] = (self.PPO.load(paths[0]), self.PPO.load(paths[1])) if paths else None
         return self._cache[key]
 
-    def supervisor(self):
-        if not self._supervisor_loaded:
-            self._supervisor_loaded = True
-            path = find_latest_model("PPO_Supervisor_NoMask")
-            self._supervisor = self.PPO.load(path) if path else None
-        return self._supervisor
+    def sort_press_paths(self, fault_tolerant, train_seed=None):
+        key = ("ft", train_seed) if fault_tolerant else "vanilla"
+        self.sort_press(fault_tolerant, train_seed)
+        return self._paths.get(key)
 
-    def control_reward_data(self, fault_tolerant, steps_test, seed):
+    def supervisor(self, train_seed=None):
+        if train_seed not in self._supervisors:
+            path = find_supervisor(train_seed)
+            self._supervisor_paths[train_seed] = path
+            self._supervisors[train_seed] = self.PPO.load(path) if path else None
+        return self._supervisors[train_seed]
+
+    def supervisor_path(self, train_seed=None):
+        self.supervisor(train_seed)
+        return self._supervisor_paths.get(train_seed)
+
+    def control_reward_data(self, fault_tolerant, steps_test, seed, train_seed=None):
         # Keyed on seed too, not just agent variant - a --seeds>1 sweep
         # calls this once per realization with a DIFFERENT episode seed,
         # and each realization needs its OWN matching control episode, not
-        # realization 0's cached one reused for every subsequent seed.
-        key = ("ft" if fault_tolerant else "vanilla", seed)
+        # realization 0's cached one reused for every subsequent seed. Also
+        # keyed on train_seed: each fault-tolerant replicate is a different
+        # policy and needs its own fault-free reference.
+        key = (("ft", train_seed) if fault_tolerant else "vanilla", seed)
         if key not in self._control_reward_data:
-            sp = self.sort_press(fault_tolerant)
+            sp = self.sort_press(fault_tolerant, train_seed)
             if sp is None:
                 self._control_reward_data[key] = None
             else:
@@ -357,8 +442,10 @@ class ModelCache:
                 self._control_reward_data[key] = control_env.reward_data
         return self._control_reward_data[key]
 
-    def wrapped_control_reward_data(self, recovery_mode, steps_test, seed):
-        key = (recovery_mode, seed)  # see control_reward_data()'s note on why seed is part of the key
+    def wrapped_control_reward_data(self, recovery_mode, steps_test, seed, train_seed=None):
+        # see control_reward_data()'s note on why seed (and the supervisor's
+        # train_seed) are part of the key
+        key = (recovery_mode, train_seed, seed)
         if key in self._wrapped_control_reward_data:
             return self._wrapped_control_reward_data[key]
 
@@ -367,7 +454,7 @@ class ModelCache:
         if sp is not None and not (
             recovery_mode == "llm_replanning" and not os.environ.get("OPENAI_API_KEY")
         ):
-            supervisor_model = self.supervisor() if recovery_mode == "supervisor" else None
+            supervisor_model = self.supervisor(train_seed) if recovery_mode == "supervisor" else None
             if recovery_mode != "supervisor" or supervisor_model is not None:
                 sort_model, press_model = sp
                 env_class = RECOVERY_REGISTRY[recovery_mode]["sensor_noise"]
@@ -389,11 +476,28 @@ class ModelCache:
                         break
                 result = control_env.reward_data
 
+                if recovery_mode == "llm_replanning":
+                    # The control episode's detector can still fire (false
+                    # alarms) and call the API - log those calls too, so
+                    # cost and success-rate numbers cover every call made.
+                    llm_log = list(getattr(control_env, "llm_decision_log", []) or [])
+                    record = {
+                        "run_id": f"control__llm_replanning__episode_seed{seed}",
+                        "status": "control",
+                        "recovery_mode": "llm_replanning",
+                        "episode_seed": seed,
+                        "llm_decision_log": llm_log,
+                        "llm_summary": summarize_llm_log(llm_log),
+                    }
+                    record.update(llm_endpoint_description())
+                    self.pending_records.append(record)
+
         self._wrapped_control_reward_data[key] = result
         return result
 
 
-def run_one(c, run_id, models, steps_test, episode_seed, fault_seed, save_plots, plot_dir, tag_prefix):
+def run_one(c, run_id, models, steps_test, episode_seed, fault_seed, save_plots, plot_dir, tag_prefix,
+            train_seed=None):
     fault_mode, recovery_mode = c["fault"], c["recovery"]
     fault_config = make_fault_config(c, fault_seed)
 
@@ -401,9 +505,11 @@ def run_one(c, run_id, models, steps_test, episode_seed, fault_seed, save_plots,
         return {"run_id": run_id, "status": "skipped", "reason": "OPENAI_API_KEY not set"}
 
     fault_tolerant = recovery_mode == "fault_tolerant_marl"
-    sp = models.sort_press(fault_tolerant)
+    ft_seed = train_seed if fault_tolerant else None
+    sp = models.sort_press(fault_tolerant, ft_seed)
     if sp is None:
-        return {"run_id": run_id, "status": "skipped", "reason": "required model weights not found"}
+        return {"run_id": run_id, "status": "skipped",
+                "reason": f"required model weights not found (train_seed={ft_seed})"}
     sort_model, press_model = sp
 
     if recovery_mode in ("none", "fault_tolerant_marl"):
@@ -414,10 +520,12 @@ def run_one(c, run_id, models, steps_test, episode_seed, fault_seed, save_plots,
     env = env_class(max_steps=steps_test, seed=episode_seed, fault_config=fault_config)
     env.set_agents(sort_agent=sort_model, press_agent=press_model)
 
+    sup_seed = train_seed if recovery_mode == "supervisor" else None
     if recovery_mode == "supervisor":
-        supervisor_model = models.supervisor()
+        supervisor_model = models.supervisor(sup_seed)
         if supervisor_model is None:
-            return {"run_id": run_id, "status": "skipped", "reason": "no trained supervisor model found"}
+            return {"run_id": run_id, "status": "skipped",
+                    "reason": f"no trained supervisor model found (train_seed={sup_seed})"}
         env.set_supervisor(supervisor_model)
 
     eval_tag = f"{tag_prefix}_{run_id}"
@@ -433,9 +541,9 @@ def run_one(c, run_id, models, steps_test, episode_seed, fault_seed, save_plots,
                 "traceback": traceback.format_exc()}
 
     if recovery_mode in ("none", "fault_tolerant_marl"):
-        control_reward_data = models.control_reward_data(fault_tolerant, steps_test, episode_seed)
+        control_reward_data = models.control_reward_data(fault_tolerant, steps_test, episode_seed, ft_seed)
     else:
-        control_reward_data = models.wrapped_control_reward_data(recovery_mode, steps_test, episode_seed)
+        control_reward_data = models.wrapped_control_reward_data(recovery_mode, steps_test, episode_seed, sup_seed)
 
     metrics = compute_recovery_metrics(
         env, fault_mode=fault_mode, recovery_mode=recovery_mode, seed=episode_seed,
@@ -447,6 +555,15 @@ def run_one(c, run_id, models, steps_test, episode_seed, fault_seed, save_plots,
     metrics["duration_type"] = c["duration_type"]
     metrics["episode_seed"] = episode_seed
     metrics["fault_seed"] = fault_seed
+    metrics["train_seed"] = train_seed if recovery_mode in SEEDED_RECOVERIES else None
+    paths = models.sort_press_paths(fault_tolerant, ft_seed)
+    metrics["sort_model_path"], metrics["press_model_path"] = paths if paths else (None, None)
+    metrics["supervisor_model_path"] = models.supervisor_path(sup_seed) if recovery_mode == "supervisor" else None
+    if recovery_mode == "llm_replanning":
+        llm_log = list(getattr(env, "llm_decision_log", []) or [])
+        metrics["llm_decision_log"] = llm_log
+        metrics["llm_summary"] = summarize_llm_log(llm_log)
+        metrics.update(llm_endpoint_description())
     if c["mode_key"]:
         metrics[c["mode_key"]] = c["mode_value"]
     return metrics
@@ -515,7 +632,8 @@ def main():
                          "single-shot behavior (not recommended - see the benchmark-score "
                          "discussion on why n=1 can't distinguish a real effect from noise).")
     p.add_argument("--transient-duration", type=int, default=20)
-    p.add_argument("--save-plots", action="store_true", help="Also save the per-run reward plot (slower, lots of files).")
+    p.add_argument("--save-plots", action="store_true",
+                    help="Save one SVG plot per run to --plot-dir (off by default; ~2 GB for the full grid).")
     p.add_argument("--plot-dir", default="./img/figures/sweep/")
     p.add_argument("--log-path", default="./log/recovery_metrics_sweep.jsonl")
     p.add_argument("--resume", action="store_true",
@@ -523,6 +641,13 @@ def main():
     p.add_argument("--limit", type=int, default=None,
                     help="Only run the first N combos per seed realization (smoke test).")
     p.add_argument("--dry-run", action="store_true", help="Print the grid and exit without running anything.")
+    p.add_argument("--train-seeds", default="auto",
+                    help="Training-seed replicates of fault_tolerant_marl/supervisor to evaluate: "
+                         "'auto' (every _ts<k> checkpoint found, else the legacy one), 'legacy', "
+                         "or a comma list like 1,2,3. See train_seeds.py.")
+    p.add_argument("--allow-llm-base-url", action="store_true",
+                    help="Allow llm_replanning to run while MARL_LLM_BASE_URL is set (proxy / "
+                         "auto-router). Off by default because the model identity is then unknown.")
     args = p.parse_args()
 
     faults = [f.strip() for f in args.faults.split(",") if f.strip()]
@@ -543,15 +668,34 @@ def main():
     if args.limit is not None:
         combos = combos[: args.limit]
 
-    total_runs = len(combos) * args.seeds + (args.seeds if args.include_baseline else 0)
+    train_seeds = resolve_train_seeds(args.train_seeds)
+    # (combo, train_seed) pairs: trained-policy mechanisms run once per
+    # replicate, every other mechanism once (train_seed=None).
+    runs = [(c, ts) for c in combos for ts in train_seeds.get(c["recovery"], [None])]
+
+    total_runs = len(runs) * args.seeds + (args.seeds if args.include_baseline else 0)
 
     print(f"\n{'=' * 70}\nFaultBench-Industrial full sweep\n{'=' * 70}")
     print(f"Fault types : {faults}")
     print(f"Recoveries  : {recoveries}")
     print(f"Targets     : {targets}")
     print(f"Durations   : {durations}")
-    print(f"Combos      : {len(combos)}  x  seeds: {args.seeds}  = {total_runs} run(s) total"
+    for mech in SEEDED_RECOVERIES:
+        if mech in recoveries:
+            seeds_label = ["legacy" if t is None else t for t in train_seeds[mech]]
+            print(f"Train seeds : {mech} -> {seeds_label}")
+    print(f"Combos      : {len(combos)} ({len(runs)} incl. training-seed replicates)  x  "
+          f"seeds: {args.seeds}  = {total_runs} run(s) total"
           f"{' (incl. 1 baseline per seed)' if args.include_baseline else ''}")
+
+    if "llm_replanning" in recoveries:
+        llm_cfg = llm_endpoint_description()
+        print(f"LLM         : requested model={llm_cfg['requested_model']}, endpoint={llm_cfg['endpoint']}")
+        if llm_cfg["endpoint"] != "OpenAI default" and not args.allow_llm_base_url and not args.dry_run:
+            print("\n❌ MARL_LLM_BASE_URL is set, so llm_replanning would go through a proxy/auto-router "
+                  "and the paper couldn't name the model. Unset it (or comment it out in .env) and set "
+                  "MARL_LLM_MODEL=gpt-4o-mini, or pass --allow-llm-base-url to run anyway.")
+            sys.exit(1)
     print(f"{'=' * 70}\n")
 
     if args.dry_run:
@@ -560,8 +704,8 @@ def main():
             if args.include_baseline:
                 print(f"  baseline__no_fault__no_recovery__seed{seed_index}"
                       f"  (episode_seed={episode_seed})")
-            for c in combos:
-                print("  " + combo_run_id(c, seed_index)
+            for c, ts in runs:
+                print("  " + combo_run_id(c, seed_index, ts)
                       + f"  (episode_seed={episode_seed}, fault_seed={fault_seed})")
         print(f"\n[dry-run] {total_runs} run(s) would run. Nothing executed.")
         return
@@ -600,21 +744,30 @@ def main():
                     n_err += 1
                     print(f"  ❌ error: {result.get('reason')}")
 
-        for i, c in enumerate(combos, 1):
-            run_id = combo_run_id(c, seed_index)
+        for i, (c, ts) in enumerate(runs, 1):
+            run_id = combo_run_id(c, seed_index, ts)
             if args.resume and run_id in done:
                 n_resumed += 1
                 continue
 
-            print(f"\n[seed {seed_index + 1}/{args.seeds}][{i}/{len(combos)}] {run_id}")
+            print(f"\n[seed {seed_index + 1}/{args.seeds}][{i}/{len(runs)}] {run_id}")
             result = run_one(c, run_id, models, args.steps, episode_seed, fault_seed,
-                              args.save_plots, args.plot_dir, tag_prefix)
+                              args.save_plots, args.plot_dir, tag_prefix, train_seed=ts)
+            result.setdefault("train_seed", ts)
             append_result(args.log_path, result)
+            for extra in models.pending_records:
+                append_result(args.log_path, extra)
+            models.pending_records.clear()
 
             status = result.get("status")
             if status == "ok":
                 n_ok += 1
                 print_recovery_metrics(result)
+                llm = result.get("llm_summary")
+                if llm:
+                    print(f"  LLM calls: {llm['n_calls']} ({llm['n_errors']} errors), "
+                          f"mean latency {llm['mean_latency_ms']} ms, models {llm['models']}, "
+                          f"tokens in/out {llm['input_tokens']}/{llm['output_tokens']}")
             elif status == "skipped":
                 n_skip += 1
                 print(f"  ⏭️  skipped: {result.get('reason')}")

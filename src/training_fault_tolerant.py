@@ -39,6 +39,7 @@ from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.callbacks import EvalCallback
 
 from src.training import save_model
+from src.model_paths import ft_prefixes
 from src.envs_train.env_1_sort_fault_tolerant import Env_1_Sorting_FaultTolerant
 from src.envs_train.env_2_press_fault_tolerant import Env_2_Pressing_FaultTolerant
 from src.envs_train.env_combined import Env_Combined
@@ -53,7 +54,8 @@ warnings.filterwarnings("ignore", category=UserWarning, module="gymnasium.spaces
 # press-teammate auto-load branch that would conflict with this file's
 # explicit teammate wiring - see module docstring above)
 # ---------------------------------------------------------*/
-def _train_ppo(env, total_timesteps, save_prefix, logpath, eval_seed=99):
+def _train_ppo(env, total_timesteps, save_prefix, logpath, eval_seed=99, ppo_seed=42,
+               best_dir="./models/best_model_ft/"):
     env = Monitor(env)
     check_env(env)
 
@@ -90,13 +92,13 @@ def _train_ppo(env, total_timesteps, save_prefix, logpath, eval_seed=99):
         "MlpPolicy", env,
         policy_kwargs=policy_kwargs, verbose=0,
         tensorboard_log=tensorboard_log,
-        ent_coef=0.05, seed=42, device="cpu",
+        ent_coef=0.05, seed=ppo_seed, device="cpu",
     )
 
     eval_callback = EvalCallback(
         eval_env,
-        best_model_save_path="./models/best_model_ft/",
-        log_path="./models/best_model_ft/",
+        best_model_save_path=best_dir,
+        log_path=best_dir,
         eval_freq=10_000, deterministic=True, render=False, verbose=0,
     )
 
@@ -108,7 +110,7 @@ def _train_ppo(env, total_timesteps, save_prefix, logpath, eval_seed=99):
     mean_r, std_r = evaluate_policy(model, env, n_eval_episodes=10)
     print(f"Final Performance: {mean_r:.2f} ± {std_r:.2f}")
 
-    best_path = "./models/best_model_ft/best_model.zip"
+    best_path = os.path.join(best_dir, "best_model.zip")
     if os.path.exists(best_path):
         print(f"📂 Loading best checkpoint model from: {best_path}")
         best_model = PPO.load(best_path, env=env)
@@ -118,7 +120,7 @@ def _train_ppo(env, total_timesteps, save_prefix, logpath, eval_seed=99):
             model = best_model
             print("🏅 Using best checkpoint for saving.")
         import shutil
-        shutil.rmtree("./models/best_model_ft/", ignore_errors=True)
+        shutil.rmtree(best_dir, ignore_errors=True)
 
     save_model(model, prefix=save_prefix, timesteps=total_timesteps)
     return model
@@ -128,38 +130,56 @@ def _train_ppo(env, total_timesteps, save_prefix, logpath, eval_seed=99):
 # Full fault-tolerant training flow (Sort, then Press with the
 # fault-tolerant Sort agent as its randomized teammate)
 # ---------------------------------------------------------*/
-def train_fault_tolerant_modular_agents(total_timesteps, steps_train, steps_test, seed, tag):
+def train_fault_tolerant_modular_agents(total_timesteps, steps_train, steps_test, seed, tag, train_seed=None):
+    """train_seed=None reproduces the original single-seed run (env seed =
+    `seed`, PPO seed 42, legacy checkpoint names). With a train_seed, that
+    seed drives the env's fault/material RNGs AND PPO's own seed, and the
+    checkpoints get a "_ts<train_seed>" tag (see src/model_paths.py), so
+    several independent training replicates can coexist - and run in
+    parallel, since each replicate also gets its own best-model dir."""
+    if train_seed is None:
+        env_seed, ppo_seed, best_dir, log_tag = seed, 42, "./models/best_model_ft/", tag
+    else:
+        env_seed, ppo_seed = train_seed, train_seed
+        best_dir = f"./models/best_model_ft_ts{train_seed}/"
+        log_tag = f"{tag}_ts{train_seed}"
+    sort_prefix, press_prefix = ft_prefixes(train_seed)
+
     print("\n[1/2] Training Fault-Tolerant Sorting Agent (domain-randomized: "
           "sensor_noise + actuator_degradation on itself)...")
-    sort_train_env = Env_1_Sorting_FaultTolerant(max_steps=steps_train, seed=seed)
+    sort_train_env = Env_1_Sorting_FaultTolerant(max_steps=steps_train, seed=env_seed)
     sort_agent = _train_ppo(
         env=sort_train_env,
         total_timesteps=total_timesteps,
-        save_prefix="PPO_Sorting_FaultTolerant_NoMask",
-        logpath=f"./log/tensorboard/{tag}_FaultTolerant",
+        save_prefix=sort_prefix,
+        logpath=f"./log/tensorboard/{log_tag}_FaultTolerant",
+        ppo_seed=ppo_seed,
+        best_dir=best_dir,
     )
-    _test_sorting_agent(sort_agent, steps_test=steps_test, seed=seed, tag=tag + "_FaultTolerant")
+    _test_sorting_agent(sort_agent, steps_test=steps_test, seed=seed, tag=log_tag + "_FaultTolerant")
 
     print("\n[2/2] Training Fault-Tolerant Pressing Agent (domain-randomized: "
           "sensor_noise + actuator_degradation on itself, plus teammate_dropout, "
           "teammate_byzantine [worst_action/fixed_malicious/random_malicious], "
           "and teammate_comms_loss [stale/blackout] simulating a faulty/compromised "
           "sorting teammate and a dropped comms link)...")
-    press_train_env = Env_2_Pressing_FaultTolerant(max_steps=steps_train, seed=seed)
+    press_train_env = Env_2_Pressing_FaultTolerant(max_steps=steps_train, seed=env_seed)
     press_train_env.set_agents(sort_agent=sort_agent)  # the FAULT-TOLERANT sort agent, not vanilla
     press_agent = _train_ppo(
         env=press_train_env,
         total_timesteps=total_timesteps,
-        save_prefix="PPO_Pressing_FaultTolerant_NoMask",
-        logpath=f"./log/tensorboard/{tag}_FaultTolerant",
+        save_prefix=press_prefix,
+        logpath=f"./log/tensorboard/{log_tag}_FaultTolerant",
+        ppo_seed=ppo_seed,
+        best_dir=best_dir,
     )
 
     _test_modular_pair(sort_agent, press_agent, steps_test=steps_test, seed=seed,
-                        tag=tag + "_FaultTolerant_trained_modular")
+                        tag=log_tag + "_FaultTolerant_trained_modular")
 
     print("\n✅ Fault-tolerant training complete. Checkpoints saved as:")
-    print(f"   ./models/PPO_Sorting_FaultTolerant_NoMask_{total_timesteps}.zip")
-    print(f"   ./models/PPO_Pressing_FaultTolerant_NoMask_{total_timesteps}.zip")
+    print(f"   ./models/{sort_prefix}_{total_timesteps}.zip")
+    print(f"   ./models/{press_prefix}_{total_timesteps}.zip")
     print("   (existing vanilla PPO_Sorting_NoMask_*/PPO_Pressing_NoMask_* checkpoints untouched)")
 
 
@@ -171,14 +191,14 @@ def train_fault_tolerant_modular_agents(total_timesteps, steps_train, steps_test
 def _test_sorting_agent(sort_agent, steps_test, seed, tag):
     combined_env = Env_Combined(max_steps=steps_test, seed=seed)
     combined_env.set_agents(sort_agent=sort_agent)
-    test_env(env=combined_env, tag=tag, title="(Test: PPO_Sort FaultTolerant - No Mask)",
+    test_env(env=combined_env, tag=tag, save=True, title="(Test: PPO_Sort FaultTolerant - No Mask)",
              steps=steps_test, dir="./img/figures/", seed=seed)
 
 
 def _test_modular_pair(sort_agent, press_agent, steps_test, seed, tag):
     combined_env = Env_Combined(max_steps=steps_test, seed=seed)
     combined_env.set_agents(sort_agent=sort_agent, press_agent=press_agent)
-    test_env(env=combined_env, tag=tag, title="(Test: Modular FaultTolerant Sort+Press - No Mask)",
+    test_env(env=combined_env, tag=tag, save=True, title="(Test: Modular FaultTolerant Sort+Press - No Mask)",
              steps=steps_test, dir="./img/figures/", seed=seed)
 
 # -----------------------------------------------------------------------------*/

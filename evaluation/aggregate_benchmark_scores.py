@@ -39,6 +39,17 @@ Output:
      recovery) control, at the same two granularities as 1/2 above. See
      compute_effect_sizes() for the definition and why it's Glass's delta
      specifically (not Cohen's d/Hedges' g).
+  5. aggregate_per_train_seed.csv / aggregate_train_seed_summary.csv - for
+     the mechanisms that are trained policies (fault_tolerant_marl,
+     supervisor), one mean per TRAINING-seed replicate, then the mean,
+     between-replicate SD, min/max and a t-based 95% CI ACROSS replicates.
+     The CIs in 1/2 treat every row as independent and so only reflect
+     evaluation-seed noise; these tables show whether a mechanism's result
+     survives retraining. See summarize_across_train_seeds().
+  6. llm_call_summary.csv - per fault type: number of LLM calls, error
+     (fallback-to-pass_through) rate, mean latency, served model name(s)
+     and token totals, from the llm_decision_log each llm_replanning record
+     carries (including the LLM control episodes' own calls).
 
 There used to also be a pooled "headline" chart per fault_mode (one bar
 per recovery_mode, averaged across every target/duration/mode combo).
@@ -119,6 +130,7 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+from scipy.stats import t as t_dist
 
 # This file lives in evaluation/, one level below the repo root. Anchor
 # the default relative paths below (./log/..., ./img/...) to the repo
@@ -207,6 +219,7 @@ def load_rows(jsonl_path: Path, exclude_baseline: bool = True) -> pd.DataFrame:
                     "extra_mode_value": extra_mode_value,
                     "run_id": record.get("run_id"),
                     "episode_seed": record.get("episode_seed"),
+                    "train_seed": record.get("train_seed"),
                     "likely_null_result": likely_null,
                     "degradation_area_corrected": event.get("total_degradation_area_corrected"),
                     "safety_excess": safety_excess,
@@ -220,10 +233,12 @@ def load_rows(jsonl_path: Path, exclude_baseline: bool = True) -> pd.DataFrame:
 
 
 def _mean_ci(series: pd.Series):
-    """Mean and a 95% CI half-width (normal approximation: 1.96 * sem).
-    With small n (few seeds) this is an approximation, not exact - report n
-    alongside it and treat CIs as indicative, not a rigorous test. Returns
-    (mean, ci_halfwidth, n) with NaN-safe handling for empty/all-NaN input."""
+    """Mean and a 95% CI half-width (Student's t: t_{0.975, n-1} * sem).
+    A t-interval rather than a normal one (1.96 * sem) because the number
+    of seeds per cell is small (~8); the t multiplier (2.365 at n=8) is
+    wider than 1.96 and converges to it as n grows, so pooled groups with
+    large n are essentially unchanged. Returns (mean, ci_halfwidth, n) with
+    NaN-safe handling for empty/all-NaN input."""
     clean = series.dropna()
     n = len(clean)
     if n == 0:
@@ -232,7 +247,7 @@ def _mean_ci(series: pd.Series):
     if n < 2:
         return mean, float("nan"), n
     sem = clean.std(ddof=1) / math.sqrt(n)
-    return mean, 1.96 * sem, n
+    return mean, float(t_dist.ppf(0.975, n - 1)) * sem, n
 
 
 def aggregate(df: pd.DataFrame, group_cols: list) -> pd.DataFrame:
@@ -323,6 +338,107 @@ def compute_effect_sizes(df: pd.DataFrame, cell_cols: list, control_mode: str = 
             records.append(row)
 
     return pd.DataFrame(records)
+
+
+SUMMARY_METRICS = [
+    ("degradation_area_corrected", "degradation_area"),
+    ("safety_excess", "safety_excess"),
+    ("fraction_time_healthy", "fraction_time_healthy"),
+    ("relapse_count", "relapse_count"),
+    ("false_recovery_rate", "false_recovery_rate"),
+    ("intervention_recall", "intervention_recall"),
+]
+
+
+def summarize_across_train_seeds(df: pd.DataFrame):
+    """Training-seed robustness for the trained-policy mechanisms.
+
+    Step 1: average every metric within each (fault_mode, recovery_mode,
+    train_seed) - i.e. over all eval seeds and target/duration/mode combos
+    for that one replicate. Step 2: treat those replicate means as the
+    sample and report their mean, SD, min, max and a t-based 95% CI.
+
+    With K replicates the CI has K-1 degrees of freedom, so it is wide by
+    design for K=3 - that's the honest answer to "is this a property of the
+    paradigm or of one training run". Mechanisms with no training seed
+    (none, rule_based, rule_based_detect, llm_replanning) are left out."""
+    seeded = df[df["train_seed"].notna()].copy()
+    if seeded.empty:
+        return pd.DataFrame(), pd.DataFrame()
+    seeded["train_seed"] = seeded["train_seed"].astype(int)
+    metric_cols = [m for m, _ in SUMMARY_METRICS]
+    # None (e.g. no detector -> no false_recovery_rate) would leave these as
+    # object columns, which groupby().mean() refuses to average.
+    seeded[metric_cols] = seeded[metric_cols].apply(pd.to_numeric, errors="coerce")
+
+    keys = ["fault_mode", "recovery_mode", "train_seed"]
+    per_seed = seeded.groupby(keys)[metric_cols].mean().reset_index()
+    per_seed.insert(3, "n_rows", seeded.groupby(keys).size().values)
+
+    records = []
+    for (fault_mode, recovery_mode), group in per_seed.groupby(["fault_mode", "recovery_mode"]):
+        row = {"fault_mode": fault_mode, "recovery_mode": recovery_mode,
+               "n_train_seeds": len(group), "train_seeds": ",".join(str(t) for t in sorted(group["train_seed"]))}
+        for metric, out_prefix in SUMMARY_METRICS:
+            vals = group[metric].dropna()
+            mean, ci, _ = _mean_ci(vals)
+            row[f"{out_prefix}_mean"] = round(mean, 4) if not math.isnan(mean) else None
+            row[f"{out_prefix}_sd_between_seeds"] = round(vals.std(ddof=1), 4) if len(vals) >= 2 else None
+            row[f"{out_prefix}_min"] = round(vals.min(), 4) if len(vals) else None
+            row[f"{out_prefix}_max"] = round(vals.max(), 4) if len(vals) else None
+            row[f"{out_prefix}_ci95"] = round(ci, 4) if not math.isnan(ci) else None
+        records.append(row)
+
+    return per_seed.round(4), pd.DataFrame(records)
+
+
+def summarize_llm_calls(jsonl_path: Path) -> pd.DataFrame:
+    """Per fault type (plus an "ALL" row): how many LLM calls were made, how
+    many fell back to pass_through on an error, mean latency of successful
+    calls, which model(s) the API reported serving them, and token totals.
+    Control-episode calls are counted under fault_mode "control"."""
+    calls_by_fault = {}
+    runs_by_fault = {}
+    with open(jsonl_path, "r") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if record.get("recovery_mode") != "llm_replanning":
+                continue
+            if record.get("status") not in ("ok", "control") or "llm_decision_log" not in record:
+                continue
+            fault = "control" if record.get("status") == "control" else record.get("fault_mode")
+            calls_by_fault.setdefault(fault, []).extend(record["llm_decision_log"])
+            runs_by_fault[fault] = runs_by_fault.get(fault, 0) + 1
+
+    if not calls_by_fault:
+        return pd.DataFrame()
+
+    def _row(label, calls, n_runs):
+        errors = [c for c in calls if c.get("error")]
+        ok_lat = [c["latency_ms"] for c in calls if not c.get("error") and c.get("latency_ms") is not None]
+        return {
+            "fault_mode": label,
+            "n_runs": n_runs,
+            "n_calls": len(calls),
+            "calls_per_run": round(len(calls) / n_runs, 2) if n_runs else None,
+            "n_errors": len(errors),
+            "error_rate": round(len(errors) / len(calls), 4) if calls else None,
+            "mean_latency_ms": round(float(np.mean(ok_lat)), 1) if ok_lat else None,
+            "median_latency_ms": round(float(np.median(ok_lat)), 1) if ok_lat else None,
+            "models": ";".join(sorted({c["model"] for c in calls if c.get("model")})),
+            "input_tokens": sum(c.get("input_tokens", 0) or 0 for c in calls),
+            "output_tokens": sum(c.get("output_tokens", 0) or 0 for c in calls),
+        }
+
+    rows = [_row(fault, calls_by_fault[fault], runs_by_fault[fault]) for fault in sorted(calls_by_fault)]
+    rows.append(_row("ALL", [c for calls in calls_by_fault.values() for c in calls], sum(runs_by_fault.values())))
+    return pd.DataFrame(rows)
 
 
 def plot_faceted_by_target_duration(df: pd.DataFrame, outdir: Path) -> list:
@@ -459,6 +575,30 @@ def main():
     effect_summary.to_csv(effect_summary_path, index=False)
     print(f"\nSaved detailed effect sizes to {effect_detail_path}")
     print(f"Saved summary effect sizes to {effect_summary_path}")
+
+    per_seed, across_seeds = summarize_across_train_seeds(df)
+    if not across_seeds.empty:
+        per_seed_path = outdir / "aggregate_per_train_seed.csv"
+        across_path = outdir / "aggregate_train_seed_summary.csv"
+        per_seed.to_csv(per_seed_path, index=False)
+        across_seeds.to_csv(across_path, index=False)
+        print("\n=== Across training seeds (fault_tolerant_marl / supervisor): mean ± 95% CI over replicates ===")
+        cols = ["fault_mode", "recovery_mode", "n_train_seeds",
+                "degradation_area_mean", "degradation_area_ci95", "degradation_area_sd_between_seeds",
+                "safety_excess_mean", "safety_excess_ci95"]
+        print(across_seeds[cols].to_string(index=False))
+        print(f"Saved per-replicate means to {per_seed_path}")
+        print(f"Saved across-replicate summary to {across_path}")
+    else:
+        print("\n(no training-seed replicates in the log - skipping the across-training-seed tables)")
+
+    llm_calls = summarize_llm_calls(jsonl_path)
+    if not llm_calls.empty:
+        llm_path = outdir / "llm_call_summary.csv"
+        llm_calls.to_csv(llm_path, index=False)
+        print("\n=== LLM call summary (llm_replanning) ===")
+        print(llm_calls.to_string(index=False))
+        print(f"Saved LLM call summary to {llm_path}")
 
     plot_faceted_by_target_duration(df, outdir)
 

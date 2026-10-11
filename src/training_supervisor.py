@@ -32,6 +32,7 @@ from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.callbacks import EvalCallback
 
 from src.training import save_model, find_latest_model
+from src.model_paths import supervisor_prefix
 from src.envs_train.env_supervisor_train import Env_SupervisorTraining
 
 import warnings
@@ -39,7 +40,8 @@ warnings.filterwarnings("ignore", category=UserWarning, module="gymnasium.spaces
 
 
 def train_supervisor(total_timesteps=1_000_000, steps_train=200, steps_test=200,
-                     seed=42, tag=None, sort_model_path=None, press_model_path=None):
+                     seed=42, tag=None, sort_model_path=None, press_model_path=None,
+                     train_seed=None):
     """
     Trains the hierarchical supervisor policy over the vanilla modular pair.
 
@@ -55,7 +57,22 @@ def train_supervisor(total_timesteps=1_000_000, steps_train=200, steps_test=200,
                           "PPO_Sorting_NoMask_*" in ./models/.
         press_model_path: PPO Pressing checkpoint to supervise; None -> latest
                           "PPO_Pressing_NoMask_*" in ./models/.
+        train_seed      : None reproduces the original single-seed run (env
+                          seed = `seed`, PPO seed 42, legacy checkpoint name
+                          "PPO_Supervisor_NoMask_*"). With a value, it drives
+                          the env's fault/world RNG AND PPO's seed, and the
+                          checkpoint is saved as "PPO_Supervisor_ts<k>_NoMask_*"
+                          (see src/model_paths.py) with its own best-model dir,
+                          so independent replicates can coexist / run in parallel.
     """
+    if train_seed is None:
+        ppo_seed, best_dir = 42, "./models/best_model_supervisor/"
+    else:
+        seed, ppo_seed = train_seed, train_seed
+        best_dir = f"./models/best_model_supervisor_ts{train_seed}/"
+        tag = f"{tag}_ts{train_seed}" if tag else f"ts{train_seed}"
+    save_prefix = supervisor_prefix(train_seed)
+
     sort_path = sort_model_path or find_latest_model("PPO_Sorting_NoMask")
     press_path = press_model_path or find_latest_model("PPO_Pressing_NoMask")
 
@@ -91,14 +108,14 @@ def train_supervisor(total_timesteps=1_000_000, steps_train=200, steps_test=200,
         verbose=1,
         tensorboard_log=tensorboard_log,
         ent_coef=0.01,
-        seed=42,
+        seed=ppo_seed,
         device="cpu",
     )
 
     eval_callback = EvalCallback(
         eval_env,
-        best_model_save_path="./models/best_model_supervisor/",
-        log_path="./models/best_model_supervisor/",
+        best_model_save_path=best_dir,
+        log_path=best_dir,
         eval_freq=10_000,
         deterministic=True,
         render=False,
@@ -115,7 +132,7 @@ def train_supervisor(total_timesteps=1_000_000, steps_train=200, steps_test=200,
     mean_r, std_r = evaluate_policy(model, train_env, n_eval_episodes=10)
     print(f"Final Performance: {mean_r:.3f} ± {std_r:.3f}")
 
-    best_path = "./models/best_model_supervisor/best_model.zip"
+    best_path = os.path.join(best_dir, "best_model.zip")
     if os.path.exists(best_path):
         print(f"📂 Loading best checkpoint model from: {best_path}")
         best_model = PPO.load(best_path, env=train_env)
@@ -124,10 +141,10 @@ def train_supervisor(total_timesteps=1_000_000, steps_train=200, steps_test=200,
         if mean_best > mean_r:
             model = best_model
             print("🏅 Using best checkpoint for saving.")
-        shutil.rmtree("./models/best_model_supervisor/", ignore_errors=True)
+        shutil.rmtree(best_dir, ignore_errors=True)
 
-    save_model(model, prefix="PPO_Supervisor_NoMask", timesteps=total_timesteps)
-    print(f"✅ Supervisor checkpoint saved → ./models/PPO_Supervisor_NoMask_{total_timesteps}.zip")
+    save_model(model, prefix=save_prefix, timesteps=total_timesteps)
+    print(f"✅ Supervisor checkpoint saved → ./models/{save_prefix}_{total_timesteps}.zip")
     print("   (existing vanilla / fault-tolerant modular checkpoints untouched)")
     return model
 

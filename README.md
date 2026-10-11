@@ -191,6 +191,26 @@ Evaluation episode length:     200 steps
 Default seed:                    42
 ```
 
+#### Training-seed replicates (fault-tolerant MARL and supervisor)
+
+These two mechanisms are trained policies, so one training run can't
+separate the paradigm's effect from that run's training variance. Train
+independent replicates non-interactively:
+
+``` text
+python train_seeds.py --variant fault_tolerant --train-seeds 1,2,3
+python train_seeds.py --variant supervisor     --train-seeds 1,2,3
+```
+
+Each replicate uses its training seed for both the environment's RNGs and
+PPO, and is saved as `PPO_Sorting_FaultTolerant_ts<k>_NoMask_*`,
+`PPO_Pressing_FaultTolerant_ts<k>_NoMask_*` or `PPO_Supervisor_ts<k>_NoMask_*`.
+Replicates (and the two variants) can be trained in parallel. The sweep
+evaluates every replicate it finds (`--train-seeds auto`), and the
+aggregation script reports results across replicates in
+`aggregate_train_seed_summary.csv`. The vanilla pair is a single training
+run and is shared by every other mechanism.
+
 ## Running an Evaluation
 
 Select:
@@ -299,35 +319,80 @@ duration range.
 
 The benchmark does not rely solely on total episode reward.
 
-For every fault-injected run, the evaluation harness records:
+For every fault-injected run, the evaluation harness records the metrics
+below. All are scored from fault onset to the end of the episode, against
+the pre-fault baseline reward (the mean total reward before onset,
+excluding the first 5 cold-start steps). A step is *healthy* when its
+total reward is at or above `baseline - max(0.15 * |baseline|, 0.06)`.
 
-### Time-to-recovery
+### Null-correction
 
-Number of steps/seconds between fault onset and restoration of the
-required performance level.
+Reward drifts within an episode even with no fault, so degradation area
+and safety excess are reported **net of a matched fault-free control
+episode** (same seed, agents and episode length; for recovery mechanisms,
+the same mechanism run with no fault). Events whose corrected degradation
+area is below 2.0 are flagged as likely null results.
 
 ### Degradation area
 
-The integral of performance loss over the recovery period.
+The cumulative reward shortfall below baseline,
+`sum(max(0, baseline - reward))`, minus the matched control's own
+shortfall (floored at 0). This captures both **how badly** the system
+performs and **for how long**.
 
-This captures not only **how quickly** the system recovers, but also
-**how badly it performs while recovering**.
+### Safety-violation excess
+
+Container fill-level violations per step and container: near-miss
+(fill > 0.90, weight 1), severe (> 0.95, weight 2) and catastrophic
+(> 1.0, weight 5), summed with those weights, minus the matched control's
+weighted count (floored at 0). The weights are an ordinal design choice.
+
+### Fraction of time healthy
+
+The share of steps from onset to the end of the episode whose reward is
+at or above the healthy threshold. Higher is better.
+
+### Relapse count
+
+How many times reward falls back below the healthy threshold after a
+confirmed recovery (15 consecutive healthy steps). Lower is better.
 
 ### False-recovery rate
 
-How often a recovery mechanism initiates recovery when no actual fault
-exists.
+For mechanisms with a detector, the fraction of **flagged (intervened)
+steps** in which no fault was actually active (equivalent to
+`1 - precision`). Not defined for `none` and `fault_tolerant_marl`.
 
-### Safety-violation count
+### Intervention recall
 
-Number of hard safety or operational constraint violations during the
-recovery process.
+The fraction of steps with a truly active fault on which the mechanism
+intervened. Not defined for `none` and `fault_tolerant_marl`.
 
-The metrics are saved to:
+### Time-to-recovery (computed, not compared)
+
+Steps from onset to confirmed recovery is still stored per run, but is
+**not used to compare mechanisms**: it exists only for events that both
+recover and are not null results, and that subset differs enormously in
+composition between mechanisms (see the note at the end of the Results
+section).
+
+Aggregation reports means with 95% confidence intervals (Student's
+t-distribution) across seeds, and Glass's delta against the no-recovery
+baseline, using the aggregation script
+`evaluation/aggregate_benchmark_scores.py`.
+
+Single-run metrics are saved to:
 
 ``` text
 log/recovery_metrics.jsonl
 ```
+
+and the full sweep to `log/recovery_metrics_sweep.jsonl`. The sweep
+(`evaluation/run_full_sweep.py`) writes per-run plots only when given
+`--save-plots`: one SVG per run in `img/figures/sweep/`, named after the
+run (fault, target, duration, mechanism, training seed, evaluation seed).
+The aggregated charts in `img/figures/benchmarks/` come from the
+aggregation script, not from the sweep.
 
 This allows the same metrics to be compared across the entire:
 
@@ -463,8 +528,9 @@ A few headline results:
 **Doing nothing is dangerous against severe faults.** For agent dropout,
 `none` and `fault_tolerant_marl` are statistically indistinguishable and
 both accumulate roughly **17x** the weighted safety-violation excess of
-`rule_based` (~1052 vs. ~61, Glass's delta = -0.93, a large effect). This
-is the strongest, most defensible result in the suite: for faults that
+`rule_based` (~1052 vs. ~61; Glass's delta = -0.77 on safety excess, a
+medium-to-large effect, and -0.93 on corrected degradation-area, a large
+effect). This is the strongest, most defensible result in the suite: for faults that
 fully compromise an agent's decision-making, leaving them uncorrected
 isn't just suboptimal, it's measurably unsafe.
 

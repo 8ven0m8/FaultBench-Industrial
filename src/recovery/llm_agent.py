@@ -71,6 +71,9 @@ class RecoveryDecision(TypedDict):
     raw_tool_calls: List[dict]     # for debugging / the qualitative analysis section
     latency_ms: float
     error: Optional[str]           # set when a fallback was used
+    model: Optional[str]           # model name the API reported back (not just the one requested)
+    input_tokens: int              # summed over every LLM round-trip of this decision
+    output_tokens: int
 
 
 # ---------------------------------------------------------*/
@@ -80,36 +83,44 @@ class RecoveryDecision(TypedDict):
 # doesn't just flip a "use the heuristic" switch.
 # ---------------------------------------------------------*/
 @tool
-def pass_through() -> str:
+def pass_through(reason: str) -> str:
     """No intervention needed this step - let the trained agents' own
     actions through unmodified. Use this when the system looks healthy,
-    or once you judge a prior intervention is no longer necessary."""
+    or once you judge a prior intervention is no longer necessary.
+    reason: one short sentence citing the observed signal behind this
+    choice (e.g. which container level or reward drop)."""
     return "pass_through selected"
 
 
 @tool
-def override_sort(sort_mode: int) -> str:
+def override_sort(sort_mode: int, reason: str) -> str:
     """Override the sorting agent's action for this step.
     sort_mode: 0 boosts materials A and C's sorting accuracy, 1 boosts
     materials B and D's sorting accuracy. Pick whichever matches the
-    currently dominant material group on the belt."""
+    currently dominant material group on the belt.
+    reason: one short sentence citing the observed signal behind this
+    choice (e.g. which container level or reward drop)."""
     return f"override_sort({sort_mode}) selected"
 
 
 @tool
-def override_press(press_id: int, material: str) -> str:
+def override_press(press_id: int, material: str, reason: str) -> str:
     """Override the pressing agent's action for this step: send a
     specific container to a specific free press.
     press_id: 1 or 2 - must be a press that is currently free (timer==0).
     material: one of "A","B","C","D","E" (E is the waste/reject container)
-    - should be whichever container is fullest and worth pressing now."""
+    - should be whichever container is fullest and worth pressing now.
+    reason: one short sentence citing the observed signal behind this
+    choice (e.g. which container level or reward drop)."""
     return f"override_press({press_id}, {material}) selected"
 
 
 @tool
-def override_both(sort_mode: int, press_id: int, material: str) -> str:
+def override_both(sort_mode: int, press_id: int, material: str, reason: str) -> str:
     """Override BOTH the sorting and pressing actions this step in one
-    call - use when both channels look compromised simultaneously."""
+    call - use when both channels look compromised simultaneously.
+    reason: one short sentence citing the observed signal behind this
+    choice (e.g. which container level or reward drop)."""
     return f"override_both({sort_mode}, {press_id}, {material}) selected"
 
 
@@ -196,8 +207,8 @@ Guidance:
   in place and the state looks like it's recovering, it's fine to keep \
   intervening; if things look healthy, use pass_through.
 - Call exactly ONE decision tool (pass_through / override_sort / \
-  override_press / override_both) and briefly explain your reasoning in \
-  one short sentence before calling it.
+  override_press / override_both), giving a one-sentence reason in its \
+  `reason` argument.
 """
 
 
@@ -208,6 +219,7 @@ class AgentState(TypedDict):
     messages: List[Any]
     turns: int
     decision: Optional[RecoveryDecision]
+    usage: List[dict]   # one {"model", "input_tokens", "output_tokens"} per LLM round-trip
 
 
 def _get_llm():
@@ -226,7 +238,21 @@ def _get_llm():
 def _llm_node(state: AgentState):
     llm = _get_llm()
     response = llm.invoke(state["messages"])
-    return {"messages": state["messages"] + [response], "turns": state["turns"] + 1}
+    # Record what the endpoint says actually served the call - with an
+    # auto-routing proxy the requested name ("auto") says nothing about
+    # which model answered, which is exactly what the paper needs to state.
+    meta = getattr(response, "response_metadata", None) or {}
+    usage = getattr(response, "usage_metadata", None) or {}
+    call_usage = {
+        "model": meta.get("model_name") or meta.get("model"),
+        "input_tokens": int(usage.get("input_tokens", 0) or 0),
+        "output_tokens": int(usage.get("output_tokens", 0) or 0),
+    }
+    return {
+        "messages": state["messages"] + [response],
+        "turns": state["turns"] + 1,
+        "usage": state.get("usage", []) + [call_usage],
+    }
 
 
 def _tool_node(state: AgentState):
@@ -267,8 +293,12 @@ def _resolve_decision(name, args, reasoning_text, raw_tool_calls) -> RecoveryDec
 
     return RecoveryDecision(
         action=name, sort_mode=sort_mode, press_id=press_id, material=material,
-        reasoning=(reasoning_text or "")[:400],
+        # gpt-4o-mini usually calls the tool with no accompanying text, so
+        # the required `reason` argument is the reliable source; message
+        # text is only a fallback.
+        reasoning=(str(args.get("reason") or "").strip() or reasoning_text or "")[:400],
         raw_tool_calls=raw_tool_calls, latency_ms=0.0, error=None,
+        model=None, input_tokens=0, output_tokens=0,
     )
 
 
@@ -320,12 +350,15 @@ def get_recovery_plan(snapshot: dict) -> RecoveryDecision:
             ],
             "turns": 0,
             "decision": None,
+            "usage": [],
         }
         result = _graph().invoke(state)
+        usage = result.get("usage", [])
         decision = result.get("decision")
         if decision is None:
-            return _fallback_decision("no decision tool called within MAX_TOOL_TURNS")
+            decision = _fallback_decision("no decision tool called within MAX_TOOL_TURNS")
         decision["latency_ms"] = round((time.monotonic() - start) * 1000, 1)
+        _attach_usage(decision, usage)
         return decision
     except Exception as exc:  # noqa: BLE001 - deliberately broad, see module docstring
         decision = _fallback_decision(f"{type(exc).__name__}: {exc}")
@@ -337,6 +370,23 @@ def _fallback_decision(error: str) -> RecoveryDecision:
     return RecoveryDecision(
         action="pass_through", sort_mode=None, press_id=None, material=None,
         reasoning=None, raw_tool_calls=[], latency_ms=0.0, error=error,
+        model=None, input_tokens=0, output_tokens=0,
     )
+
+
+def _attach_usage(decision: RecoveryDecision, usage: List[dict]) -> None:
+    models = [u["model"] for u in usage if u.get("model")]
+    decision["model"] = models[-1] if models else None
+    decision["input_tokens"] = sum(u.get("input_tokens", 0) for u in usage)
+    decision["output_tokens"] = sum(u.get("output_tokens", 0) for u in usage)
+
+
+def llm_endpoint_description() -> dict:
+    """What the sweep is configured to call, for logging alongside results.
+    Only says WHETHER a custom base URL is set, never the URL itself."""
+    return {
+        "requested_model": DEFAULT_MODEL,
+        "endpoint": "custom MARL_LLM_BASE_URL" if DEFAULT_BASE_URL else "OpenAI default",
+    }
 
 # -----------------------------------------------------------------------------*/

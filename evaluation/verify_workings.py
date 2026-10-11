@@ -80,10 +80,12 @@ DURATION_MODES = {
 }
 BASE_FAULT_CONFIG = {"injection_step_range": (40, 60), "target": "both"}
 
-VANILLA_SORT_PATH = "./models/PPO_Sorting_NoMask_10000000.zip"
-VANILLA_PRESS_PATH = "./models/PPO_Pressing_NoMask_10000000.zip"
-FT_SORT_PATH = "./models/PPO_Sorting_FaultTolerant_NoMask_10000000.zip"
-FT_PRESS_PATH = "./models/PPO_Pressing_FaultTolerant_NoMask_10000000.zip"
+# Fault-tolerant / supervisor: legacy single-seed checkpoint if present,
+# else the lowest-numbered training-seed replicate (src/model_paths.py).
+# This is a wiring check, so one replicate is enough.
+from src.model_paths import VANILLA_SORT_PATH, VANILLA_PRESS_PATH, default_ft_pair, default_supervisor
+_ft = default_ft_pair()
+FT_SORT_PATH, FT_PRESS_PATH = (_ft[0], _ft[1]) if _ft else ("<missing>", "<missing>")
 
 failures = []
 warnings_ = []
@@ -103,7 +105,8 @@ print("=" * 90)
 
 have_vanilla = os.path.exists(VANILLA_SORT_PATH) and os.path.exists(VANILLA_PRESS_PATH)
 have_ft = os.path.exists(FT_SORT_PATH) and os.path.exists(FT_PRESS_PATH)
-supervisor_path = find_latest_model("PPO_Supervisor_NoMask")
+_sup = default_supervisor()
+supervisor_path = _sup[0] if _sup else None
 have_supervisor = supervisor_path is not None
 have_openai_key = bool(os.environ.get("OPENAI_API_KEY"))
 

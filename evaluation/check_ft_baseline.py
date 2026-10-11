@@ -32,8 +32,14 @@ This does not replace the full sweep -- it's a fast, 4-episode check to
 tell you whether retraining actually helped before you spend the time
 running run_full_sweep.py's full grid.
 
-Usage: python evaluation/check_ft_baseline.py (run from the repo root)
+Usage: python evaluation/check_ft_baseline.py [--train-seed K] (run from the repo root)
+  --train-seed K checks one training-seed replicate (see train_seeds.py);
+  without it, the legacy single-seed checkpoint (or, if that's gone, the
+  lowest-numbered replicate) is checked. The "was" numbers below are from
+  the original single-seed models, so they're a reference point, not a
+  like-for-like comparison for a different replicate.
 """
+import argparse
 import os
 import sys
 import warnings
@@ -53,6 +59,7 @@ from stable_baselines3 import PPO
 from src.envs_train.env_combined import Env_Combined
 from src.envs_train.env_fault_actuator_degradation import Env_ActuatorDegradationFault
 from src.envs_train.env_fault_agent_dropout import Env_AgentDropoutFault
+from src.model_paths import VANILLA_SORT_PATH, VANILLA_PRESS_PATH, find_ft_pair, default_ft_pair
 
 STEPS = 200
 SEED = 42
@@ -73,10 +80,19 @@ BASE_FAULT_CONFIG = {
 }
 
 
-def load_pair(fault_tolerant):
-    suffix = "FaultTolerant_" if fault_tolerant else ""
-    sort_path = f"./models/PPO_Sorting_{suffix}NoMask_10000000.zip"
-    press_path = f"./models/PPO_Pressing_{suffix}NoMask_10000000.zip"
+def load_pair(fault_tolerant, train_seed=None):
+    if not fault_tolerant:
+        sort_path, press_path = VANILLA_SORT_PATH, VANILLA_PRESS_PATH
+    else:
+        if train_seed is not None:
+            pair = find_ft_pair(train_seed)
+        else:
+            found = default_ft_pair()
+            pair = found[:2] if found else None
+        if pair is None:
+            raise SystemExit(f"No fault-tolerant checkpoint found (train_seed={train_seed}).")
+        sort_path, press_path = pair
+        print(f"  FT checkpoints: {sort_path}, {press_path}")
     return PPO.load(sort_path), PPO.load(press_path)
 
 
@@ -125,9 +141,13 @@ def report(label, vanilla_score, ft_score, prev_vanilla, prev_ft):
 
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--train-seed", type=int, default=None)
+    args = parser.parse_args()
+
     print("Loading vanilla and fault-tolerant checkpoints...")
     sort_v, press_v = load_pair(fault_tolerant=False)
-    sort_ft, press_ft = load_pair(fault_tolerant=True)
+    sort_ft, press_ft = load_pair(fault_tolerant=True, train_seed=args.train_seed)
 
     clean_v = run_clean(sort_v, press_v)
     clean_ft = run_clean(sort_ft, press_ft)

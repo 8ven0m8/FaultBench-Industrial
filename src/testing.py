@@ -23,6 +23,10 @@ def test_env(env=None, tag="", save=False, title="", steps=50, dir="./img/", see
         mode (str): Kept for interface compatibility; only "model" is used
                     in the no-mask modular pipeline.
         model: Single-agent model to use, if testing one agent in isolation.
+        save (bool): Save the episode plot to `dir` as
+                     "<tag>_env_simulation.svg". Off by default - callers that
+                     want the plot pass save=True explicitly.
+        show (bool): Also open the plot in a window.
     """
     if env is None:
         raise ValueError("Environment must be provided")
@@ -49,10 +53,10 @@ def test_env(env=None, tag="", save=False, title="", steps=50, dir="./img/", see
             if stats:
                 print(f"\n---- Testing Results - {mode} ----")
                 print(f"🏁 Epoch ended after \033[1m{i + 1}\033[0m steps.")
-                env.render(save=True, log_dir=dir, filename=f'{tag}_env_simulation', title=title, show=show,
+                env.render(save=save, log_dir=dir, filename=f'{tag}_env_simulation', title=title, show=show,
                            steps_test=steps)
             else:
-                env.render(save=True, log_dir=dir, filename=f'{tag}_env_simulation', title=title, show=show,
+                env.render(save=save, log_dir=dir, filename=f'{tag}_env_simulation', title=title, show=show,
                            checksum=False, steps_test=steps)
 
             total_rewards = [sum(reward) for reward in env.reward_data['Reward']]

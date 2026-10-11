@@ -209,6 +209,14 @@ def _score_single_channel(
     )
 
     window_len = fault_window_end - onset_idx
+    # Onset-based: count healthy steps over the SAME window the denominator
+    # uses (onset .. end of episode), so the steps between onset and the
+    # first degraded step - healthy by definition - are credited too. The
+    # loop above only counts from degradation_start, which undercounted.
+    time_in_recovered_state = sum(
+        1 for i in range(onset_idx, fault_window_end)
+        if _is_finite_number(series[i]) and float(series[i]) >= threshold
+    )
     fraction_time_healthy = (time_in_recovered_state / window_len) if window_len > 0 else 0.0
 
     total_degradation_area = sum(

@@ -21,7 +21,8 @@ from src.recovery.llm_replanning import LLM_REGISTRY
 
 # RL: Trainer / Tester
 from src.testing import test_env
-from src.training import RL_Trainer, find_latest_model
+from src.training import RL_Trainer
+from src.model_paths import VANILLA_SORT_PATH, VANILLA_PRESS_PATH, default_ft_pair, default_supervisor
 from utils.metrics import compute_recovery_metrics, print_recovery_metrics, save_recovery_metrics
 
 # ---------------------------------------------------------*/
@@ -323,14 +324,14 @@ def train_modular_agents(total_timesteps, steps_train, steps_test, seed, tag):
 def test_sorting_agent(sort_agent, steps_test, seed, tag):
     combined_env = Env_Combined(max_steps=steps_test, seed=seed)
     combined_env.set_agents(sort_agent=sort_agent)
-    test_env(env=combined_env, tag=tag, title="(Test: PPO_Sort - No Mask)",
+    test_env(env=combined_env, tag=tag, save=SAVE, title="(Test: PPO_Sort - No Mask)",
              steps=steps_test, dir=DIR, seed=seed)
 
 
 def test_modular_pair(sort_agent, press_agent, steps_test, seed, tag):
     combined_env = Env_Combined(max_steps=steps_test, seed=seed)
     combined_env.set_agents(sort_agent=sort_agent, press_agent=press_agent)
-    test_env(env=combined_env, tag=tag, title="(Test: Modular Sort+Press - No Mask)",
+    test_env(env=combined_env, tag=tag, save=SAVE, title="(Test: Modular Sort+Press - No Mask)",
              steps=steps_test, dir=DIR, seed=seed)
 
 
@@ -345,16 +346,20 @@ def run_trained_modular_agents(steps_test, seed, tag, fault_mode="none", recover
         # training (see src/training_fault_tolerant.py) - no recovery_hook
         # correction is applied at eval time, so these load into the SAME
         # plain fault env everything else uses (see env_class selection below).
-        sort_path = "./models/PPO_Sorting_FaultTolerant_NoMask_10000000.zip"
-        press_path = "./models/PPO_Pressing_FaultTolerant_NoMask_10000000.zip"
+        # Legacy single-seed checkpoint if present, else the lowest-numbered
+        # training-seed replicate (see src/model_paths.py / train_seeds.py).
+        ft = default_ft_pair()
+        if ft is None:
+            print("⚠️ No fault-tolerant models found. Train them via 'Train or Test? -> train' -> "
+                  "'fault_tolerant', or `python train_seeds.py --variant fault_tolerant --train-seeds 1`.")
+            return
+        sort_path, press_path, ft_train_seed = ft
+        print(f"📂 Fault-tolerant pair (train_seed={ft_train_seed}): {sort_path}, {press_path}")
     else:
-        sort_path = "./models/PPO_Sorting_NoMask_10000000.zip"
-        press_path = "./models/PPO_Pressing_NoMask_10000000.zip"
+        sort_path, press_path = VANILLA_SORT_PATH, VANILLA_PRESS_PATH
 
     if not (os.path.exists(sort_path) and os.path.exists(press_path)):
         print(f"⚠️ Models not found. Please ensure both {sort_path} and {press_path} exist.")
-        if recovery_mode == "fault_tolerant_marl":
-            print("   (Run 'Train or Test? -> train' then choose 'fault_tolerant' to produce them.)")
         return
 
     sort_model = PPO.load(sort_path)
@@ -395,10 +400,11 @@ def run_trained_modular_agents(steps_test, seed, tag, fault_mode="none", recover
         # The supervisor policy is trained to recover the vanilla modular pair
         # (see src/training_supervisor.py). Attach the latest checkpoint so the
         # combo env's recovery_hook() derives its intervention from predict().
-        supervisor_path = find_latest_model("PPO_Supervisor_NoMask")
-        if not supervisor_path:
+        sup = default_supervisor()
+        if sup is None:
             print("⚠️ No trained Supervisor model found. Train one via 'Train or Test? -> train' then 'supervisor'.")
             return
+        supervisor_path = sup[0]
         supervisor_model = PPO.load(supervisor_path)
         env.set_supervisor(supervisor_model)
         print(f"📂 Loading Supervisor model from: {supervisor_path}")
