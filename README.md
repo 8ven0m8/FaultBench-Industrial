@@ -1,5 +1,7 @@
 # FaultBench-Industrial. A Benchmark for fault recovery mechanisms in Multi Agent Reinforcement Learning Industrial Systems
 
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.23304785.svg)](https://doi.org/10.5281/zenodo.23304785)
+
 A benchmark for evaluating **self-healing and fault-recovery mechanisms
 in multi-agent industrial control systems**.
 
@@ -47,7 +49,7 @@ The current fault suite contains five fault classes:
     </tr>
     <tr>
       <td><code>comms_loss</code></td>
-      <td>Drops communication/messages from an affected agent</td>
+      <td>Cuts the press agent's view of the sorting stage (frozen at a stale value or blanked out); press channel only</td>
     </tr>
     <tr>
       <td><code>byzantine</code></td>
@@ -404,17 +406,25 @@ matrix.
 
 ## Experimental Matrix
 
-The intended benchmark compares:
+The benchmark compares:
 
 ``` text
 5 fault types
 ×
+3 targets (sort, press, both; comms_loss is press only)
+×
 2 fault durations
 ×
-5 recovery conditions
+1-3 fault-specific modes
+=
+52 fault conditions, each evaluated under 6 recovery conditions
 ```
 
-where the recovery conditions are:
+Every combination is run over 8 evaluation seeds, and the two trained
+mechanisms (`fault_tolerant_marl`, `supervisor`) over each of 3 training
+seeds: 4,160 fault-injected runs plus 8 fault-free baselines.
+
+The recovery conditions are:
 
 1.  no recovery
 2.  rule-based
@@ -517,8 +527,9 @@ industrial-flavored MARL testbed.
 
 ## Results
 
-The full sweep ran every (fault type x duration x recovery mechanism)
-combination across 8 seeds, with 95% confidence intervals and Glass's
+The full sweep ran every (fault type x target x duration x mode x recovery
+mechanism) combination across 8 evaluation seeds (and 3 training seeds for
+the two trained mechanisms), with 95% confidence intervals and Glass's
 delta effect sizes computed against the no-recovery baseline. The
 complete breakdown - all 30 faceted charts, per-fault findings, and
 effect-size tables - is on the
@@ -538,7 +549,7 @@ isn't just suboptimal, it's measurably unsafe.
 
 **Fault-tolerant training doesn't transfer to every fault class.**
 Against actuator degradation, `fault_tolerant_marl` tracks `none` almost
-exactly on corrected degradation-area (46.4 vs. 45.4, delta = +0.02 -
+exactly on corrected degradation-area (43.0 vs. 45.4, delta = -0.05 -
 essentially no effect), while every detection- or oracle-based mechanism
 beats both by a wide margin. Domain-randomized robustness training is not
 a substitute for actively detecting and reacting to a fault.
@@ -547,10 +558,10 @@ a substitute for actively detecting and reacting to a fault.
 
 **The best mechanism is fault-dependent, not universal.** Communication
 loss is the one fault class where `fault_tolerant_marl` outright wins
-(6.3 mean degradation-area vs. 21.9 for `none`), rather than tying it as
-it does everywhere else - consistent with this being the mildest,
-most partial-information fault tested. No single recovery paradigm
-dominates across the whole suite (see RQ1 above).
+(2.1 mean degradation-area vs. 21.9 for `none`), rather than tying it as
+it does on the other faults (sensor noise aside, where it gains a little) - consistent with this being one of the mildest,
+most partial-information faults tested. No single recovery paradigm
+dominates across the whole suite.
 
 <img src="img/figures/benchmarks/aggregate_faceted__comms_loss__degradation_area.png" alt="Corrected degradation-area by duration, communication loss, all six recovery mechanisms" width="800">
 
@@ -560,6 +571,20 @@ result, and that qualifying subset differs enormously in composition
 between mechanisms (see the
 [metric glossary](https://faultbench.pranjalsapkota.com/results.html#glossary)
 on the results page for the full reasoning).
+
+## Data Availability
+
+The complete results - the trajectory graph for every one of the 4,168
+runs, the raw per-run metrics log, and the aggregate tables and charts -
+are archived on Zenodo:
+
+> Sapkota, P. (2026). *FaultBench-Industrial: full per-run evaluation
+> results* [Dataset]. Zenodo. https://doi.org/10.5281/zenodo.23304785
+
+The files are embargoed until 10 November 2026; the record's description
+and DOI are public now. The archive was produced with commit
+[`f79f25e`](https://github.com/8ven0m8/FaultBench-Industrial/tree/f79f25ef76bceff69a28a2522811ec1327644c0d)
+of this repository.
 
 ## Research Goal
 
